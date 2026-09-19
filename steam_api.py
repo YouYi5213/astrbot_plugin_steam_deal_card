@@ -24,9 +24,21 @@ from .models import (
     to_decimal,
 )
 
-STEAM_GET_ITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
+STEAM_GET_ITEMS_PATH = "/IStoreBrowseService/GetItems/v1/"
+# Steam answers the same API on two hosts. The global one is unreachable from
+# mainland China hosts (connect hangs until timeout) while the China one is
+# fast there, and vice versa is never a problem, so requests fail over between
+# them and the first host that answers is remembered for later calls.
+STEAM_API_BASES = (
+    "https://api.steampowered.com",
+    "https://api.steamchina.com",
+)
+STEAM_GET_ITEMS_URL = STEAM_API_BASES[0] + STEAM_GET_ITEMS_PATH
 STEAM_SEARCH_RESULTS_URL = "https://store.steampowered.com/search/results/"
 STEAM_ASSET_BASE = "https://shared.akamai.steamstatic.com/store_item_assets/"
+# Capsule images live at predictable paths, which matters because the China API
+# does not report a main_capsule filename the way the global one does.
+STEAM_CAPSULE_FALLBACKS = ("capsule_616x353.jpg", "header.jpg")
 HEYBOX_SEARCH_URL = "https://api.xiaoheihe.cn/game/search/"
 HEYBOX_HISTORY_URL = "https://api.xiaoheihe.cn/game/get_game_prices/history/v2"
 HEYBOX_WEB_BASE = "https://www.xiaoheihe.cn"
@@ -61,6 +73,9 @@ class SteamStoreClient:
         """
         self.client = client
         self.language = language
+        # Remembered after the first successful call so later requests do not
+        # pay the connection timeout of the unreachable host on every lookup.
+        self._api_base: str | None = None
 
     async def get_items(
         self,
@@ -78,44 +93,69 @@ class SteamStoreClient:
             omitted rather than raising.
 
         Raises:
-            SteamApiError: If the endpoint fails or returns an unusable body.
+            SteamApiError: If every known API host fails.
         """
         result: dict[int, dict[str, Any]] = {}
         unique = [appid for appid in dict.fromkeys(appids) if appid > 0]
         for start in range(0, len(unique), _GET_ITEMS_CHUNK):
             chunk = unique[start : start + _GET_ITEMS_CHUNK]
-            payload = {
-                "ids": [{"appid": appid} for appid in chunk],
-                "context": {
-                    "language": self.language,
-                    "country_code": country,
-                    "steam_realm": 1,
-                },
-                "data_request": {
-                    "include_all_purchase_options": True,
-                    "include_assets": True,
-                    "include_reviews": True,
-                    "include_basic_info": True,
-                    "include_release": True,
-                    "include_platforms": True,
-                },
-            }
-            try:
-                response = await self.client.get(
-                    STEAM_GET_ITEMS_URL,
-                    params={"input_json": json.dumps(payload, separators=(",", ":"))},
-                )
-                response.raise_for_status()
-                body = response.json()
-            except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
-                raise SteamApiError(f"Steam 商店数据请求失败：{exc}") from exc
-
+            body = await self._request_items(chunk, country)
             items = (body.get("response") or {}).get("store_items") or []
             for item in items:
                 appid = item.get("appid")
                 if isinstance(appid, int) and item.get("success", True):
                     result[appid] = item
         return result
+
+    async def _request_items(self, appids: list[int], country: str) -> dict[str, Any]:
+        """Request one chunk, failing over between the Steam API hosts.
+
+        Args:
+            appids: Steam application ids for this chunk.
+            country: Steam storefront country code.
+
+        Returns:
+            The decoded response body.
+
+        Raises:
+            SteamApiError: If no host answered.
+        """
+        payload = {
+            "ids": [{"appid": appid} for appid in appids],
+            "context": {
+                "language": self.language,
+                "country_code": country,
+                "steam_realm": 1,
+            },
+            "data_request": {
+                "include_all_purchase_options": True,
+                "include_assets": True,
+                "include_reviews": True,
+                "include_basic_info": True,
+                "include_release": True,
+                "include_platforms": True,
+            },
+        }
+        params = {"input_json": json.dumps(payload, separators=(",", ":"))}
+
+        preferred = [self._api_base] if self._api_base else []
+        bases = preferred + [base for base in STEAM_API_BASES if base not in preferred]
+        failures: list[str] = []
+        for base in bases:
+            try:
+                response = await self.client.get(base + STEAM_GET_ITEMS_PATH, params=params)
+                response.raise_for_status()
+                body = response.json()
+            except Exception as exc:  # noqa: BLE001 - try the next host
+                failures.append(f"{base}（{_describe_error(exc)}）")
+                # A cached host that stopped answering must not stay pinned.
+                if self._api_base == base:
+                    self._api_base = None
+                continue
+            self._api_base = base
+            return body
+
+        raise SteamApiError("Steam 商店数据请求失败：" + "；".join(failures))
 
     async def specials(self, country: str = "CN", limit: int = 20) -> list[dict[str, Any]]:
         """Fetch the current Steam specials list.
@@ -152,7 +192,7 @@ class SteamStoreClient:
                 response.raise_for_status()
                 body = response.json()
             except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
-                raise SteamApiError(f"Steam 特惠列表请求失败：{exc}") from exc
+                raise SteamApiError(f"Steam 特惠列表请求失败：{_describe_error(exc)}") from exc
 
             page = _parse_specials_page(body.get("results_html") or "")
             if not page:
@@ -202,7 +242,7 @@ class HeyboxClient:
             response.raise_for_status()
             body = response.json()
         except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
-            raise SteamApiError(f"小黑盒搜索请求失败：{exc}") from exc
+            raise SteamApiError(f"小黑盒搜索请求失败：{_describe_error(exc)}") from exc
 
         games = (body.get("result") or {}).get("games") or []
         candidates: list[GameCandidate] = []
@@ -250,7 +290,7 @@ class HeyboxClient:
             response.raise_for_status()
             body = response.json()
         except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
-            raise SteamApiError(f"小黑盒历史价格请求失败：{exc}") from exc
+            raise SteamApiError(f"小黑盒历史价格请求失败：{_describe_error(exc)}") from exc
 
         result = body.get("result") or {}
         info = result.get("lowest_info") or {}
@@ -380,6 +420,10 @@ def parse_reviews(item: dict[str, Any]) -> ReviewSummary | None:
 def capsule_url(item: dict[str, Any]) -> str:
     """Build the best available capsule image URL for a store item.
 
+    The global API reports a ``main_capsule`` filename while the China API only
+    reports the asset URL template, so the filename falls back to Steam's fixed
+    path for capsule art.
+
     Args:
         item: One ``store_items`` entry.
 
@@ -390,11 +434,31 @@ def capsule_url(item: dict[str, Any]) -> str:
     template = str(assets.get("asset_url_format") or "")
     filename = str(assets.get("main_capsule") or assets.get("header") or "")
     if not filename:
-        return ""
-    if not template:
         appid = item.get("appid")
-        template = f"steam/apps/{appid}/${{FILENAME}}"
+        if not isinstance(appid, int) or appid <= 0:
+            return ""
+        if not template:
+            template = f"steam/apps/{appid}/${{FILENAME}}"
+        filename = STEAM_CAPSULE_FALLBACKS[0]
+    if not template:
+        return ""
     return STEAM_ASSET_BASE + template.replace("${FILENAME}", filename)
+
+
+def _describe_error(exc: BaseException) -> str:
+    """Describe an exception, which may stringify to nothing.
+
+    httpx timeout errors carry no message, which previously produced a user
+    facing error that ended in a bare colon.
+
+    Args:
+        exc: The exception to describe.
+
+    Returns:
+        The exception message, or its class name when the message is empty.
+    """
+    text = str(exc).strip()
+    return text or type(exc).__name__
 
 
 def build_game_card(

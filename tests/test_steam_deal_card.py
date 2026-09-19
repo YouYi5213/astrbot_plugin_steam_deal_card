@@ -336,8 +336,15 @@ class CapsuleUrlTests(unittest.TestCase):
         )
         self.assertTrue(url.endswith("steam/apps/1/header.jpg"))
 
-    def test_returns_empty_without_assets(self) -> None:
-        self.assertEqual(capsule_url({"appid": 1}), "")
+    def test_builds_a_url_from_the_appid_when_assets_are_absent(self) -> None:
+        # The China API omits capsule filenames entirely, so a usable URL is
+        # still derived from the appid rather than giving up.
+        url = capsule_url({"appid": 1})
+        self.assertTrue(url.endswith("steam/apps/1/capsule_616x353.jpg"))
+
+    def test_returns_empty_without_an_appid(self) -> None:
+        self.assertEqual(capsule_url({}), "")
+        self.assertEqual(capsule_url({"appid": 0}), "")
 
 
 class BuildCardTests(unittest.TestCase):
