@@ -1,10 +1,7 @@
 """AstrBot entry point for the Steam deal card plugin."""
 
-# NOTE: do not add `from __future__ import annotations` here. AstrBot resolves
-# the handler signature with `eval_str=True` and compares the `query` annotation
-# against the GreedyStr class object; stringified annotations break that check,
-# which would silently truncate multi-word game names to the first word.
 import base64
+import re
 import ssl
 import time
 
@@ -12,18 +9,54 @@ import httpx
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.star.filter.command import GreedyStr
 
 from .models import GameCandidate, GameCard
 from .service import LookupError, SteamDealService
 from .steam_api import HeyboxClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，并列出当前促销游戏。"
 )
+
+# Command matching uses regex filters rather than command filters on purpose.
+# AstrBot's CommandFilter requires the message to carry the configured
+# wake_prefix or an @-mention, so a bare "steam游戏 ..." would be silently
+# ignored. RegexFilter is explicitly exempt from that requirement, which is how
+# the sibling terraria plugin accepts bare commands.
+_GAME_COMMANDS = ("steam游戏查询", "steam游戏", "steam查价", "steam价格")
+_DEALS_COMMANDS = ("steam打折", "steam特惠", "steam促销", "steam优惠")
+
+# Longest names first so "steam游戏查询" is not shadowed by "steam游戏".
+_GAME_CMD_RE = re.compile(
+    r"^/?(?:" + "|".join(re.escape(name) for name in _GAME_COMMANDS) + r")(?:\s|$)"
+)
+_DEALS_CMD_RE = re.compile(
+    r"^/?(?:" + "|".join(re.escape(name) for name in _DEALS_COMMANDS) + r")(?:\s|$)"
+)
+
+
+def _strip_command(message: str, names: tuple[str, ...]) -> str:
+    """Remove a leading command word from a message.
+
+    Args:
+        message: Raw message text.
+        names: Accepted command names, longest first.
+
+    Returns:
+        The remaining argument text, with the command and an optional leading
+        slash removed.
+    """
+    text = (message or "").strip()
+    if text.startswith("/"):
+        text = text[1:].strip()
+    for name in names:
+        if text.startswith(name):
+            return text[len(name) :].strip()
+    return text
+
 
 # A pending disambiguation list expires so a stale "1" cannot pick a wrong game.
 _PENDING_TTL_SECONDS = 300
@@ -100,26 +133,17 @@ class SteamDealCardPlugin(Star):
         await self.http.aclose()
         logger.info("Steam deal card plugin stopped.")
 
-    @filter.command(
-        "steam游戏",
-        alias={"steam游戏查询", "steam查价", "steam价格"},
-        desc="以图片查询 Steam 游戏的当前价、史低与评价。",
-    )
-    async def steam_game_command(
-        self,
-        event: AstrMessageEvent,
-        query: GreedyStr,
-    ):
+    @filter.regex(_GAME_CMD_RE, priority=10)
+    async def steam_game_command(self, event: AstrMessageEvent):
         """Handle the game lookup command.
 
         Args:
             event: The incoming message event.
-            query: Game name, appid, Steam URL or a candidate index.
 
         Yields:
             Text or image results.
         """
-        text = (query or "").strip()
+        text = _strip_command(event.get_message_str(), _GAME_COMMANDS)
         session = event.unified_msg_origin
 
         if not text:
@@ -171,23 +195,19 @@ class SteamDealCardPlugin(Star):
         async for result in self._render_card(event, lookup.card):
             yield result
 
-    @filter.command(
-        "steam打折",
-        alias={"steam特惠", "steam促销", "steam优惠"},
-        desc="以图片列出 Steam 当前促销的游戏。",
-    )
-    async def steam_deals_command(self, event: AstrMessageEvent, limit: int = 0):
+    @filter.regex(_DEALS_CMD_RE, priority=10)
+    async def steam_deals_command(self, event: AstrMessageEvent):
         """Handle the specials command.
 
         Args:
             event: The incoming message event.
-            limit: Optional number of games to show.
 
         Yields:
             Text or image results.
         """
+        text = _strip_command(event.get_message_str(), _DEALS_COMMANDS)
         try:
-            wanted = limit if limit > 0 else None
+            wanted = int(text) if text.isdigit() and int(text) > 0 else None
             deals = await self.service.deals(wanted)
             image = await self.service.render_deals(deals)
         except LookupError as exc:
