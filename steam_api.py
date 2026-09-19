@@ -1,0 +1,554 @@
+"""HTTP clients for the public Steam and Heybox endpoints used by the plugin.
+
+No API key is required. The Steam endpoints are public storefront services and
+the Heybox endpoints are the ones the Heybox website itself calls.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+
+from .models import (
+    DealItem,
+    GameCandidate,
+    GameCard,
+    LowestPrice,
+    PriceInfo,
+    ReviewSummary,
+    to_decimal,
+)
+
+STEAM_GET_ITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
+STEAM_SEARCH_RESULTS_URL = "https://store.steampowered.com/search/results/"
+STEAM_ASSET_BASE = "https://shared.akamai.steamstatic.com/store_item_assets/"
+HEYBOX_SEARCH_URL = "https://api.xiaoheihe.cn/game/search/"
+HEYBOX_HISTORY_URL = "https://api.xiaoheihe.cn/game/get_game_prices/history/v2"
+HEYBOX_WEB_BASE = "https://www.xiaoheihe.cn"
+
+# Steam caps the infinite-scroll endpoint at 100 rows per request.
+_MAX_PAGE_SIZE = 100
+# Keep a single GetItems call within a size the endpoint answers quickly.
+_GET_ITEMS_CHUNK = 50
+
+_ROW_RE = re.compile(r'<a[^>]*class="[^"]*search_result_row[^"]*"[\s\S]*?</a>')
+_APPID_RE = re.compile(r'data-ds-appid="([\d,]+)"')
+_TITLE_RE = re.compile(r'<span class="title">([^<]+)</span>')
+_CAPSULE_RE = re.compile(r'<div class="search_capsule">\s*<img src="([^"]+)"')
+_DISCOUNT_RE = re.compile(r'data-discount="(\d+)"')
+_FINAL_RE = re.compile(r'discount_final_price">([^<]*)<')
+_ORIGINAL_RE = re.compile(r'discount_original_price">([^<]*)<')
+
+
+class SteamApiError(RuntimeError):
+    """Raised when a required upstream response cannot be used."""
+
+
+class SteamStoreClient:
+    """Client for the public Steam storefront endpoints."""
+
+    def __init__(self, client: httpx.AsyncClient, language: str = "schinese") -> None:
+        """Store the shared HTTP client.
+
+        Args:
+            client: Shared async HTTP client.
+            language: Steam storefront language code.
+        """
+        self.client = client
+        self.language = language
+
+    async def get_items(
+        self,
+        appids: list[int],
+        country: str = "CN",
+    ) -> dict[int, dict[str, Any]]:
+        """Fetch price, review, asset and metadata for many appids at once.
+
+        Args:
+            appids: Steam application ids to look up.
+            country: Steam storefront country code.
+
+        Returns:
+            Mapping of appid to the raw store item payload. Unknown appids are
+            omitted rather than raising.
+
+        Raises:
+            SteamApiError: If the endpoint fails or returns an unusable body.
+        """
+        result: dict[int, dict[str, Any]] = {}
+        unique = [appid for appid in dict.fromkeys(appids) if appid > 0]
+        for start in range(0, len(unique), _GET_ITEMS_CHUNK):
+            chunk = unique[start : start + _GET_ITEMS_CHUNK]
+            payload = {
+                "ids": [{"appid": appid} for appid in chunk],
+                "context": {
+                    "language": self.language,
+                    "country_code": country,
+                    "steam_realm": 1,
+                },
+                "data_request": {
+                    "include_all_purchase_options": True,
+                    "include_assets": True,
+                    "include_reviews": True,
+                    "include_basic_info": True,
+                    "include_release": True,
+                    "include_platforms": True,
+                },
+            }
+            try:
+                response = await self.client.get(
+                    STEAM_GET_ITEMS_URL,
+                    params={"input_json": json.dumps(payload, separators=(",", ":"))},
+                )
+                response.raise_for_status()
+                body = response.json()
+            except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
+                raise SteamApiError(f"Steam 商店数据请求失败：{exc}") from exc
+
+            items = (body.get("response") or {}).get("store_items") or []
+            for item in items:
+                appid = item.get("appid")
+                if isinstance(appid, int) and item.get("success", True):
+                    result[appid] = item
+        return result
+
+    async def specials(self, country: str = "CN", limit: int = 20) -> list[dict[str, Any]]:
+        """Fetch the current Steam specials list.
+
+        Args:
+            country: Steam storefront country code.
+            limit: Maximum number of discounted entries to return.
+
+        Returns:
+            Raw row dicts with appid, name, capsule and price text.
+
+        Raises:
+            SteamApiError: If the listing endpoint fails.
+        """
+        rows: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        wanted = max(limit, 1)
+        start = 0
+        while len(rows) < wanted and start < 500:
+            count = min(_MAX_PAGE_SIZE, max(wanted * 2, 50))
+            try:
+                response = await self.client.get(
+                    STEAM_SEARCH_RESULTS_URL,
+                    params={
+                        "query": "",
+                        "start": start,
+                        "count": count,
+                        "specials": 1,
+                        "infinite": 1,
+                        "cc": country,
+                        "l": self.language,
+                    },
+                )
+                response.raise_for_status()
+                body = response.json()
+            except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
+                raise SteamApiError(f"Steam 特惠列表请求失败：{exc}") from exc
+
+            page = _parse_specials_page(body.get("results_html") or "")
+            if not page:
+                break
+            for row in page:
+                if row["appid"] in seen:
+                    continue
+                seen.add(row["appid"])
+                rows.append(row)
+            start += count
+        return rows[:wanted]
+
+
+class HeyboxClient:
+    """Client for the public Heybox endpoints used for name lookup and history."""
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        """Store the shared HTTP client.
+
+        Args:
+            client: Shared async HTTP client.
+        """
+        self.client = client
+
+    async def search(self, query: str) -> list[GameCandidate]:
+        """Search Heybox for a game name.
+
+        Unlike the Steam storefront search this endpoint understands Chinese
+        names, so it is what lets ``泰拉瑞亚`` resolve to appid 105600.
+
+        Args:
+            query: Raw user supplied game name.
+
+        Returns:
+            Candidate games. Console and mobile entries are dropped, as are
+            soundtracks, DLC and demos which are never what the user meant.
+
+        Raises:
+            SteamApiError: If the endpoint fails.
+        """
+        try:
+            response = await self.client.get(
+                HEYBOX_SEARCH_URL,
+                params={"q": query},
+                headers={"Referer": f"{HEYBOX_WEB_BASE}/"},
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
+            raise SteamApiError(f"小黑盒搜索请求失败：{exc}") from exc
+
+        games = (body.get("result") or {}).get("games") or []
+        candidates: list[GameCandidate] = []
+        for game in games:
+            if not isinstance(game, dict):
+                continue
+            appid = game.get("steam_appid")
+            name = str(game.get("name") or "").strip()
+            # Heybox reports `type: "game"` plus `game_type: "pc"|"console"|...`.
+            # Only PC entries map onto a Steam appid we can price.
+            if game.get("game_type") != "pc" or not isinstance(appid, int) or not name:
+                continue
+            # Drop soundtracks, DLC, demos and playtests; the user wants the game.
+            if game.get("type") not in (None, "game"):
+                continue
+            candidates.append(
+                GameCandidate(
+                    appid=appid,
+                    name=name,
+                    source="heybox",
+                    popularity=int(game.get("follow_num") or 0),
+                )
+            )
+        return candidates
+
+    async def lowest_price(self, appid: int, country: str = "cn") -> LowestPrice | None:
+        """Fetch the all time lowest price for an appid.
+
+        Args:
+            appid: Steam application id.
+            country: Heybox region code.
+
+        Returns:
+            The lowest recorded price, or None when unavailable.
+
+        Raises:
+            SteamApiError: If the endpoint fails.
+        """
+        try:
+            response = await self.client.get(
+                HEYBOX_HISTORY_URL,
+                params={"appid": appid, "platf": "steam", "cc": country, "days": 99999},
+                headers={"Referer": f"{HEYBOX_WEB_BASE}/app/topic/game/pc/{appid}"},
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
+            raise SteamApiError(f"小黑盒历史价格请求失败：{exc}") from exc
+
+        result = body.get("result") or {}
+        info = result.get("lowest_info") or {}
+        value = to_decimal(info.get("price"))
+        if value is None:
+            return None
+        currency = str((result.get("lowest_info_v2") or {}).get("currency") or "").strip()
+        return LowestPrice(
+            value=value,
+            currency=currency,
+            recorded_on=_format_history_date(info.get("date")),
+            discount_percent=int(info.get("discount") or 0),
+        )
+
+
+async def download_image(client: httpx.AsyncClient, url: str) -> bytes | None:
+    """Download an image, returning None instead of raising on failure.
+
+    Args:
+        client: Shared async HTTP client.
+        url: Absolute image URL.
+
+    Returns:
+        The raw image bytes, or None when the download failed.
+    """
+    if not url:
+        return None
+    try:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
+    except Exception:  # noqa: BLE001 - a missing image must not break the card
+        return None
+
+
+def _parse_specials_page(results_html: str) -> list[dict[str, Any]]:
+    """Extract discounted rows from the infinite-scroll search payload.
+
+    Args:
+        results_html: The ``results_html`` field of the search response.
+
+    Returns:
+        Row dicts with appid, name, capsule, discount and price text.
+    """
+    rows: list[dict[str, Any]] = []
+    for match in _ROW_RE.finditer(results_html):
+        row = match.group(0)
+        appid_match = _APPID_RE.search(row)
+        if not appid_match:
+            continue
+        raw_appid = appid_match.group(1)
+        # Bundles list several appids; they have no single price to show.
+        if "," in raw_appid:
+            continue
+        title_match = _TITLE_RE.search(row)
+        if not title_match:
+            continue
+        discount_match = _DISCOUNT_RE.search(row)
+        if not discount_match:
+            continue
+        final_match = _FINAL_RE.search(row)
+        if not final_match:
+            continue
+        original_match = _ORIGINAL_RE.search(row)
+        capsule_match = _CAPSULE_RE.search(row)
+        rows.append(
+            {
+                "appid": int(raw_appid),
+                "name": html.unescape(title_match.group(1)).strip(),
+                "discount": int(discount_match.group(1)),
+                "final": html.unescape(final_match.group(1)).strip(),
+                "original": html.unescape(original_match.group(1)).strip()
+                if original_match
+                else "",
+                "capsule": capsule_match.group(1) if capsule_match else "",
+            }
+        )
+    return rows
+
+
+def parse_price(item: dict[str, Any]) -> PriceInfo | None:
+    """Build a :class:`PriceInfo` from a store item payload.
+
+    Args:
+        item: One ``store_items`` entry.
+
+    Returns:
+        The parsed price, or None for free or unpriced items.
+    """
+    option = item.get("best_purchase_option") or {}
+    current_text = str(option.get("formatted_final_price") or "").strip()
+    if not current_text:
+        return None
+    original_text = str(option.get("formatted_original_price") or "").strip()
+    discount = int(option.get("discount_pct") or 0)
+    return PriceInfo(
+        formatted_current=current_text,
+        formatted_original=original_text or current_text,
+        discount_percent=discount,
+        current_value=_cents_to_decimal(option.get("final_price_in_cents")),
+        original_value=_cents_to_decimal(option.get("original_price_in_cents")),
+        discount_end=_parse_discount_end(option.get("active_discounts")),
+    )
+
+
+def parse_reviews(item: dict[str, Any]) -> ReviewSummary | None:
+    """Build a :class:`ReviewSummary` from a store item payload.
+
+    Args:
+        item: One ``store_items`` entry.
+
+    Returns:
+        The review summary, or None when Steam reports no reviews.
+    """
+    summary = (item.get("reviews") or {}).get("summary_filtered") or {}
+    count = int(summary.get("review_count") or 0)
+    label = str(summary.get("review_score_label") or "").strip()
+    if not count and not label:
+        return None
+    return ReviewSummary(
+        label=label or "暂无评价",
+        percent_positive=int(summary.get("percent_positive") or 0),
+        review_count=count,
+    )
+
+
+def capsule_url(item: dict[str, Any]) -> str:
+    """Build the best available capsule image URL for a store item.
+
+    Args:
+        item: One ``store_items`` entry.
+
+    Returns:
+        An absolute image URL, or an empty string when the item has no assets.
+    """
+    assets = item.get("assets") or {}
+    template = str(assets.get("asset_url_format") or "")
+    filename = str(assets.get("main_capsule") or assets.get("header") or "")
+    if not filename:
+        return ""
+    if not template:
+        appid = item.get("appid")
+        template = f"steam/apps/{appid}/${{FILENAME}}"
+    return STEAM_ASSET_BASE + template.replace("${FILENAME}", filename)
+
+
+def build_game_card(
+    appid: int,
+    item: dict[str, Any],
+    lowest: LowestPrice | None = None,
+) -> GameCard:
+    """Assemble a :class:`GameCard` from a store item payload.
+
+    Args:
+        appid: Steam application id.
+        item: The matching ``store_items`` entry.
+        lowest: Optional all time lowest price.
+
+    Returns:
+        The assembled card.
+    """
+    basic = item.get("basic_info") or {}
+    release = item.get("release") or {}
+    return GameCard(
+        appid=appid,
+        name=str(item.get("name") or f"appid={appid}").strip(),
+        price=parse_price(item),
+        reviews=parse_reviews(item),
+        capsule_url=capsule_url(item),
+        lowest=lowest,
+        release_date=_format_release_date(release.get("steam_release_date")),
+        developers=_people_names(basic.get("developers")),
+        short_description=str(basic.get("short_description") or "").strip(),
+        is_free=parse_price(item) is None and not item.get("best_purchase_option"),
+    )
+
+
+def build_deal_item(
+    row: dict[str, Any],
+    item: dict[str, Any] | None,
+    lowest: LowestPrice | None = None,
+) -> DealItem | None:
+    """Assemble a :class:`DealItem`, preferring enriched store data.
+
+    Args:
+        row: A parsed specials list row.
+        item: The matching store item, when the batch lookup succeeded.
+        lowest: Optional all time lowest price.
+
+    Returns:
+        The assembled deal item, or None when no price could be determined.
+    """
+    price = parse_price(item) if item else None
+    if price is None:
+        # Fall back to the listing row, which still carries display prices.
+        price = PriceInfo(
+            formatted_current=row["final"],
+            formatted_original=row["original"] or row["final"],
+            discount_percent=row["discount"],
+        )
+    if not price.formatted_current:
+        return None
+    return DealItem(
+        appid=row["appid"],
+        name=(str(item.get("name")) if item and item.get("name") else row["name"]).strip(),
+        price=price,
+        capsule_url=capsule_url(item) if item else row["capsule"],
+        lowest=lowest,
+        reviews=parse_reviews(item) if item else None,
+    )
+
+
+def _cents_to_decimal(value: Any) -> Any:
+    """Convert a Steam cents string into a Decimal amount.
+
+    Args:
+        value: Price in cents, as a string or number.
+
+    Returns:
+        The amount as a Decimal, or None when the value is not numeric.
+    """
+    cents = to_decimal(value)
+    return None if cents is None else cents / 100
+
+
+def _parse_discount_end(active_discounts: Any) -> datetime | None:
+    """Read the earliest discount end timestamp from a purchase option.
+
+    Args:
+        active_discounts: The ``active_discounts`` list of a purchase option.
+
+    Returns:
+        The end time in UTC, or None when no discount is scheduled to end.
+    """
+    if not isinstance(active_discounts, list):
+        return None
+    stamps = [
+        int(entry["discount_end_date"])
+        for entry in active_discounts
+        if isinstance(entry, dict) and entry.get("discount_end_date")
+    ]
+    if not stamps:
+        return None
+    return datetime.fromtimestamp(min(stamps), tz=timezone.utc)
+
+
+def _format_release_date(value: Any) -> str:
+    """Format a Steam release timestamp as a date string.
+
+    Args:
+        value: Unix timestamp from the store item payload.
+
+    Returns:
+        An ISO date string, or an empty string when unavailable.
+    """
+    stamp = to_decimal(value)
+    if stamp is None or stamp <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(stamp), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _format_history_date(value: Any) -> str:
+    """Normalise a Heybox lowest-price date into an ISO date string.
+
+    Args:
+        value: Either an ISO date string or a Unix timestamp.
+
+    Returns:
+        An ISO date string, or the original text when it cannot be parsed.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stamp = to_decimal(text)
+    if stamp is not None and stamp > 0:
+        try:
+            return datetime.fromtimestamp(float(stamp), tz=timezone.utc).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            return text
+    return text
+
+
+def _people_names(value: Any) -> tuple[str, ...]:
+    """Extract names from Steam developer or publisher lists.
+
+    Args:
+        value: The ``developers`` or ``publishers`` field.
+
+    Returns:
+        A tuple of non-empty names.
+    """
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        str(entry.get("name")).strip()
+        for entry in value
+        if isinstance(entry, dict) and str(entry.get("name") or "").strip()
+    )

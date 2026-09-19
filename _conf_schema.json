@@ -1,0 +1,28 @@
+{
+  "timeout_seconds": {
+    "type": "int",
+    "description": "HTTP 请求超时时间。",
+    "default": 20
+  },
+  "country": {
+    "type": "string",
+    "description": "Steam 商店区域代码，影响价格与货币。",
+    "default": "CN"
+  },
+  "language": {
+    "type": "string",
+    "description": "Steam 商店语言代码，影响游戏名与描述语言。",
+    "default": "schinese"
+  },
+  "history_country": {
+    "type": "string",
+    "description": "小黑盒历史价格区域代码，用于查询史低。",
+    "default": "cn"
+  },
+  "max_deals": {
+    "type": "int",
+    "description": "steam打折 默认显示的游戏数量。",
+    "hint": "范围 1-20，数量越多渲染越慢。",
+    "default": 10
+  }
+}
