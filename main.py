@@ -18,12 +18,16 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.3.1"
+PLUGIN_VERSION = "1.3.2"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
     "列出当前促销游戏，并查询实时在线人数与热度排行。"
 )
+
+# The official storefront is often unreachable from mainland China, so the
+# card also links a Heybox page, which mirrors every appid and needs no login.
+STEAM_MIRROR_URL_TEMPLATE = "https://www.xiaoheihe.cn/app/topic/game/{appid}"
 
 # Command matching uses regex filters rather than command filters on purpose.
 # AstrBot's CommandFilter requires the message to carry the configured
@@ -349,10 +353,9 @@ class SteamDealCardPlugin(Star):
             logger.warning(f"Steam card render failed, falling back to text: {exc}")
             yield event.plain_result(_card_as_text(card))
             return
-        yield _image_result(event, image)
-        # A URL drawn inside an image cannot be tapped, so the link is sent as
-        # its own text message where the client can make it clickable.
-        yield event.plain_result(f"{card.name}：{card.store_url}")
+        # A URL inside an image cannot be tapped, so it travels as text in the
+        # same message chain rather than as a second message.
+        yield _image_result(event, image, caption=_store_link_text(card))
 
     async def _render_candidates(
         self,
@@ -432,7 +435,7 @@ class SteamDealCardPlugin(Star):
             self._pending.pop(key, None)
 
 
-def _image_result(event: AstrMessageEvent, image: bytes):
+def _image_result(event: AstrMessageEvent, image: bytes, caption: str = ""):
     """Build an image result the aiocqhttp adapter can actually send.
 
     ``event.image_result()`` routes the string through the media resolver,
@@ -440,15 +443,66 @@ def _image_result(event: AstrMessageEvent, image: bytes):
     "File name too long". Building the component ourselves keeps the payload
     in the ``file`` field, which is the slot that understands the scheme.
 
+    The caption rides in the same chain so the image and its text arrive as one
+    message; sending them separately produced two visible chat bubbles.
+
     Args:
         event: The incoming message event.
         image: PNG image bytes.
+        caption: Optional text to send alongside the image.
 
     Returns:
-        A message chain result carrying one base64 image.
+        A message chain result carrying the image and any caption.
     """
     encoded = base64.b64encode(image).decode("ascii")
-    return event.chain_result([Comp.Image(file=f"base64://{encoded}")])
+    chain: list = [Comp.Image(file=f"base64://{encoded}")]
+    if caption:
+        chain.append(Comp.Plain(text=caption))
+    return event.chain_result(chain)
+
+
+def _store_link_text(card: GameCard) -> str:
+    """Build the caption carrying the game's store links.
+
+    The official storefront is frequently unreachable from mainland China, so
+    a reachable mirror is offered first and the official link is kept last as
+    the canonical reference.
+
+    Args:
+        card: The game card.
+
+    Returns:
+        The caption text, or an empty string when there is no link to show.
+    """
+    entries = (
+        ("\u5546\u54c1\u8be6\u60c5", _mirror_url(card)),  # 商品详情
+        ("Steam \u5546\u5e97", card.store_url),  # Steam 商店
+    )
+    lines = []
+    seen = set()
+    for label, url in entries:
+        if url and url not in seen:
+            seen.add(url)
+            lines.append(f"{label}\uff1a{url}")  # fullwidth colon
+    return "\n".join(lines)
+
+
+def _mirror_url(card: GameCard) -> str:
+    """Return a storefront link reachable from mainland China.
+
+    Heybox mirrors every Steam app under a predictable appid path and is
+    reachable without an account; its page renders client side, which is fine
+    because the user opens it in a browser.
+
+    Args:
+        card: The game card.
+
+    Returns:
+        A mirror URL, or an empty string when none can be built.
+    """
+    if not card.appid:
+        return ""
+    return STEAM_MIRROR_URL_TEMPLATE.format(appid=card.appid)
 
 
 def _card_as_text(card: GameCard) -> str:

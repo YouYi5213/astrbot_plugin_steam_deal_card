@@ -115,8 +115,15 @@ def _install_astrbot_stub() -> None:
         def __init__(self, **kwargs):
             self.file = kwargs.get("file", "")
 
+    class _Plain:
+        """Minimal stand-in for the real text component."""
+
+        def __init__(self, text="", **kwargs):
+            self.text = text
+
     components_mod = types.ModuleType("astrbot.api.message_components")
     components_mod.Image = _Image
+    components_mod.Plain = _Plain
     api.message_components = components_mod
 
     root = types.ModuleType("astrbot")
@@ -483,27 +490,16 @@ class CommandRegistrationTests(unittest.TestCase):
 
 
 class StoreLinkDeliveryTests(unittest.TestCase):
-    """A URL drawn inside an image cannot be tapped.
+    """The store link must be tappable and must ride with the image.
 
-    Drawing the link on the card is not enough: the user would have to retype
-    it. The link must also be sent as a text message, which clients turn into a
-    clickable link.
+    A URL drawn inside an image cannot be tapped, so it travels as text as
+    well. It must share one message with the image: sending it separately
+    produced two visible chat bubbles for a single query.
     """
 
-    def test_card_handler_emits_a_text_link(self) -> None:
-        source = MAIN_SOURCE
-        # The link message is built from the card's own store_url.
-        self.assertIn("card.store_url", source)
-
-    def test_link_text_is_a_separate_plain_result(self) -> None:
+    def test_card_handler_emits_the_link_in_the_image_message(self) -> None:
         plugin = plugin_main
-        card = plugin.GameCard(
-            appid=105600,
-            name="Terraria",
-            price=None,
-            reviews=None,
-        )
-        self.assertTrue(card.store_url.endswith("/app/105600/"))
+        card = plugin.GameCard(appid=105600, name="Terraria", price=None, reviews=None)
 
         class _Event:
             def plain_result(self, text):
@@ -528,19 +524,48 @@ class StoreLinkDeliveryTests(unittest.TestCase):
             return out
 
         results = asyncio.run(drive())
-        kinds = [r[0] for r in results]
-        self.assertIn("chain", kinds, "the image must still be sent")
-        self.assertIn("text", kinds, "the link must be sent as clickable text")
-        # Both an image and the link, in that order.
-        self.assertEqual(kinds, ["chain", "text"])
-        self.assertIn("Terraria", results[1][1])
-        self.assertIn(card.store_url, results[1][1])
+        # Exactly one message, and it is the chain.
+        self.assertEqual(len(results), 1, "the query must produce one message")
+        kind, chain = results[0]
+        self.assertEqual(kind, "chain")
+        self.assertEqual(len(chain), 2, f"unexpected chain length: {len(chain)}")
+        # The image comes first, then the caption that carries the link.
+        self.assertTrue(hasattr(chain[0], "file"))
+        self.assertTrue(chain[0].file.startswith("base64://"))
+        self.assertTrue(hasattr(chain[1], "text"))
+
+        caption = chain[1].text
+        self.assertIn(card.store_url, caption)
+        self.assertIn("商品详情", caption)
+
+    def test_caption_labels_the_mirror_and_the_official_link(self) -> None:
+        card = plugin_main.GameCard(105600, "Terraria", None, None)
+        caption = plugin_main._store_link_text(card)
+        self.assertIn("商品详情：", caption)
+        self.assertIn("Steam 商店：", caption)
+        self.assertIn("xiaoheihe.cn", caption)
+        self.assertIn(card.store_url, caption)
+        # Each link sits on its own line so the labels stay readable.
+        self.assertEqual(len(caption.splitlines()), 2)
+
+    def test_mirror_url_uses_the_appid(self) -> None:
+        card = plugin_main.GameCard(413150, "Stardew Valley", None, None)
+        url = plugin_main._mirror_url(card)
+        self.assertIn("413150", url)
+        self.assertTrue(url.startswith("https://"))
+
+    def test_caption_never_repeats_a_url(self) -> None:
+        # A card whose appid cannot build a mirror must not duplicate the
+        # official link.
+        card = plugin_main.GameCard(0, "Unknown", None, None)
+        caption = plugin_main._store_link_text(card)
+        urls = [line.split("：", 1)[1] for line in caption.splitlines() if "：" in line]
+        self.assertEqual(len(urls), len(set(urls)))
 
     def test_render_failure_still_includes_the_link(self) -> None:
         # The text fallback already carries the URL, so nothing is lost.
-        plugin = plugin_main
-        card = plugin.GameCard(105600, "Terraria", None, None)
-        text = plugin._card_as_text(card)
+        card = plugin_main.GameCard(105600, "Terraria", None, None)
+        text = plugin_main._card_as_text(card)
         self.assertIn(card.store_url, text)
 
 
