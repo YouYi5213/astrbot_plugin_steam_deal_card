@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -31,6 +32,8 @@ PADDING = 28
 # Sentence marks that should never be left dangling at the end of a wrapped
 # line, which reads as a rendering bug rather than as truncation.
 _TRAILING_MARKS = "。，、；：！？,.;:!?）)】」』 \t"
+# Any run of whitespace, used to flatten text before it is measured.
+_WHITESPACE_RE = re.compile(r"\s+")
 
 # Player counts are a "right now" figure, so the card stamps it in a local
 # clock rather than UTC. China has used a single fixed +08:00 offset since 1991
@@ -136,6 +139,24 @@ def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> float:
     return draw.textlength(text, font=font)
 
 
+def _flatten(text: str) -> str:
+    """Collapse every whitespace run, including newlines, into single spaces.
+
+    Store payloads embed newlines in fields the card draws as one paragraph.
+    Pillow refuses to measure text containing a newline (``ValueError: can't
+    measure length of multiline text``), so text is flattened before it is
+    measured. Flattening also stops a stray tab or newline from moving the
+    layout, which the card's fixed-height rows cannot absorb.
+
+    Args:
+        text: Raw text from a store payload.
+
+    Returns:
+        The text with whitespace runs collapsed and both ends stripped.
+    """
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
 def _truncate(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -154,6 +175,9 @@ def _truncate(
         Text that fits, ending in an ellipsis when it had to be cut.
     """
     if max_width <= 0 or not text:
+        return ""
+    text = _flatten(text)
+    if not text:
         return ""
     if _text_width(draw, text, font) <= max_width:
         return text
@@ -199,6 +223,9 @@ def _wrap(
     Returns:
         The wrapped lines, with the final line ellipsized when truncated.
     """
+    if not text:
+        return []
+    text = _flatten(text)
     if not text:
         return []
     lines: list[str] = []

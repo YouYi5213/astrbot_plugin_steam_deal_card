@@ -125,12 +125,35 @@ class HeyboxFallbackTests(unittest.TestCase):
     """Chinese resolution dies with Heybox, so the plugin must degrade clearly."""
 
     def test_heybox_is_preferred_when_it_works(self) -> None:
+        # Both sources are consulted now, because each resolves names the other
+        # cannot; the better match still has to win.
         heybox = _WorkingHeybox([GameCandidate(105600, "Terraria", score=0.0)])
         search = _SearchStub([GameCandidate(1, "Wrong")])
         service = _service(heybox, search, {105600: {"name": "Terraria"}})
-        asyncio.run(service.resolve_game("Terraria"))
+        result = asyncio.run(service.resolve_game("Terraria"))
         self.assertEqual(heybox.calls, 1)
-        self.assertEqual(search.calls, 0)
+        self.assertEqual(search.calls, 1)
+        self.assertIsNotNone(result.card)
+        self.assertEqual(result.card.appid, 105600)
+
+    def test_a_game_only_steam_can_resolve_still_matches(self) -> None:
+        # 崩坏3 is the motivating case: Heybox only has it under a synthetic id
+        # and that entry is dropped, so Steam's own search has to resolve it.
+        heybox = _WorkingHeybox([])
+        search = _SearchStub([GameCandidate(1668940, "崩坏3")])
+        service = _service(heybox, search, {1668940: {"name": "崩坏3"}})
+        result = asyncio.run(service.resolve_game("崩坏3"))
+        self.assertIsNotNone(result.card)
+        self.assertEqual(result.card.appid, 1668940)
+
+    def test_duplicate_appids_from_both_sources_collapse(self) -> None:
+        # The same game often comes back from both, with different names.
+        heybox = _WorkingHeybox([GameCandidate(292030, "巫师3：狂猎", popularity=10)])
+        search = _SearchStub([GameCandidate(292030, "The Witcher 3: Wild Hunt")])
+        service = _service(heybox, search, {292030: {"name": "巫师3：狂猎"}})
+        result = asyncio.run(service.resolve_game("巫师3"))
+        self.assertIsNotNone(result.card)
+        self.assertEqual(result.card.appid, 292030)
 
     def test_falls_back_to_steam_search_when_heybox_fails(self) -> None:
         heybox = _FailingHeybox()

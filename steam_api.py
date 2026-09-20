@@ -529,6 +529,14 @@ class HeyboxClient:
             # Drop soundtracks, DLC, demos and playtests; the user wants the game.
             if game.get("type") not in (None, "game"):
                 continue
+            # Heybox gives its own synthetic ids to games it has no Steam appid
+            # for. They are always >= 9e8, they never resolve on Steam, and the
+            # real Steam id is absent. Measured on 137 PC rows: every row with a
+            # non-null `appid` used a real Steam id, and all 30 rows without one
+            # were synthetic (0/12 sampled synthetic ids existed on Steam).
+            # Example: 崩坏3 is 1668940 on Steam but 900045980 here.
+            if _is_synthetic_appid(appid):
+                continue
             candidates.append(
                 GameCandidate(
                     appid=appid,
@@ -578,12 +586,20 @@ class HeyboxClient:
 
 
 class SteamSearchClient:
-    """Fallback name resolver backed by the Steam storefront search.
+    """Name resolver backed by the Steam storefront search.
 
-    This exists only to cover a Heybox outage. Steam's own search does not
-    understand Chinese (``泰拉瑞亚`` returns nothing), so it is no replacement
-    for Heybox, but it still resolves English names and therefore keeps the
-    plugin usable in some form while Heybox is down.
+    This covers what Heybox cannot, and also runs alongside it because the two
+    disagree in useful ways. Steam matches official localized titles, including
+    Chinese ones, but only when the query is close to the store's own wording:
+    measured on 15 Chinese names the JSON endpoint resolved ``崩坏3``, ``巫师3``,
+    ``黑神话：悟空``, ``艾尔登法环``, ``赛博朋克2077`` and ``双人成行``, while
+    colloquial short forms such as ``泰拉瑞亚``, ``只狼`` and ``空洞骑士``
+    returned nothing at all.
+
+    The search results endpoint is the more robust of the two despite the
+    messier HTML: it is served by both storefront hosts, so it still answers
+    when the global storefront is unreachable, and its index is wider (it
+    resolved ``只狼`` and ``空洞骑士``, which the JSON endpoint could not).
     """
 
     def __init__(self, client: httpx.AsyncClient, language: str = "schinese") -> None:
@@ -599,11 +615,53 @@ class SteamSearchClient:
     async def search(self, query: str) -> list[GameCandidate]:
         """Search the Steam storefront for a game name.
 
+        Two endpoints are tried because they have different coverage and
+        different availability. The JSON endpoint returns cleaner data but only
+        exists on the global host, which is intermittently unreachable from
+        mainland China. The search results endpoint is served by both hosts, so
+        it still answers when the global storefront is down.
+
         Args:
             query: Raw user supplied game name.
 
         Returns:
             Candidate games, best match first.
+
+        Raises:
+            SteamApiError: If both endpoints fail.
+        """
+        problems: list[str] = []
+        answered = False
+        try:
+            candidates = await self._search_json(query)
+            answered = True
+            if candidates:
+                return candidates
+        except SteamApiError as exc:
+            problems.append(str(exc))
+
+        try:
+            candidates = await self._search_results_html(query)
+            answered = True
+            if candidates:
+                return candidates
+        except SteamApiError as exc:
+            problems.append(str(exc))
+
+        # An endpoint that answered with nothing is a real "no such game", which
+        # is different from being unable to ask.
+        if answered:
+            return []
+        raise SteamApiError(problems[0] if problems else "Steam 搜索请求失败")
+
+    async def _search_json(self, query: str) -> list[GameCandidate]:
+        """Query the JSON store search endpoint.
+
+        Args:
+            query: Raw user supplied game name.
+
+        Returns:
+            Candidate games, which may be empty.
 
         Raises:
             SteamApiError: If the endpoint fails.
@@ -633,6 +691,48 @@ class SteamSearchClient:
             candidates.append(GameCandidate(appid=appid, name=name, source="steam"))
         return candidates
 
+    async def _search_results_html(self, query: str) -> list[GameCandidate]:
+        """Query the search results endpoint, trying both storefront hosts.
+
+        Args:
+            query: Raw user supplied game name.
+
+        Returns:
+            Candidate games, which may be empty.
+
+        Raises:
+            SteamApiError: If no host answered.
+        """
+        last_error = "unknown"
+        for base in STEAM_SEARCH_BASES:
+            try:
+                response = await self.client.get(
+                    base + STEAM_SEARCH_PATH,
+                    params={
+                        "term": query,
+                        "infinite": 1,
+                        "start": 0,
+                        "count": _MAX_PAGE_SIZE,
+                        "cc": "CN",
+                        "l": self.language,
+                    },
+                )
+                response.raise_for_status()
+                body = response.json()
+            except Exception as exc:  # noqa: BLE001 - retried on the next host
+                last_error = _describe_error(exc)
+                continue
+
+            results_html = body.get("results_html") if isinstance(body, dict) else ""
+            rows = _parse_specials_page(results_html or "")
+            if rows:
+                return [
+                    GameCandidate(appid=row["appid"], name=row["name"], source="steam")
+                    for row in rows
+                ]
+
+        raise SteamApiError(f"Steam 搜索请求失败：{last_error}")
+
 
 async def download_image(client: httpx.AsyncClient, url: str) -> bytes | None:
     """Download an image, returning None instead of raising on failure.
@@ -652,6 +752,23 @@ async def download_image(client: httpx.AsyncClient, url: str) -> bytes | None:
         return response.content
     except Exception:  # noqa: BLE001 - a missing image must not break the card
         return None
+
+
+# Heybox assigns synthetic ids in this range to games it has no Steam id for.
+# Real Steam appids are still around 4 million, so the gap is wide.
+_SYNTHETIC_APPID_FLOOR = 900_000_000
+
+
+def _is_synthetic_appid(appid: int) -> bool:
+    """Report whether an appid is a Heybox placeholder rather than a Steam id.
+
+    Args:
+        appid: Appid reported by Heybox.
+
+    Returns:
+        True when the id cannot exist on Steam.
+    """
+    return appid >= _SYNTHETIC_APPID_FLOOR
 
 
 def parse_home_shelf(page: str, anchor: str) -> list[dict[str, Any]]:

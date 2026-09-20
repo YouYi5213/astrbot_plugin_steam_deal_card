@@ -70,6 +70,33 @@ class GameLookupResult:
         return self.card is None and bool(self.candidates)
 
 
+def _dedupe_candidates(candidates: list[GameCandidate]) -> list[GameCandidate]:
+    """Collapse candidates that share an appid, keeping the richest entry.
+
+    Both sources can return the same game, and their names differ by language,
+    so the entry carrying the most information is kept.
+
+    Args:
+        candidates: Candidates from every source, in source order.
+
+    Returns:
+        One candidate per appid, in first-seen order.
+    """
+    merged: dict[int, GameCandidate] = {}
+    for candidate in candidates:
+        existing = merged.get(candidate.appid)
+        if existing is None:
+            merged[candidate.appid] = candidate
+            continue
+        # Prefer a name the matcher can use against the query, then popularity.
+        if (candidate.popularity, len(candidate.name)) > (
+            existing.popularity,
+            len(existing.name),
+        ):
+            merged[candidate.appid] = candidate
+    return list(merged.values())
+
+
 def extract_appid(text: str) -> int | None:
     """Pull a Steam appid out of a raw query.
 
@@ -179,30 +206,34 @@ class SteamDealService:
         return GameLookupResult(card=None, candidates=tuple(ranked), query=text)
 
     async def _search_candidates(self, text: str) -> tuple[list[GameCandidate], bool]:
-        """Resolve a name to candidates, falling back when Heybox is down.
+        """Resolve a name to candidates by consulting both sources.
 
-        Chinese names can only be resolved through Heybox, so when that call
-        fails the plugin tries the Steam storefront search as a partial
-        replacement. Steam's search does not understand Chinese, but it does
-        keep English names and appids working instead of failing outright.
+        Heybox understands colloquial Chinese names, but it gives its own
+        synthetic ids to games it has no Steam id for and those are dropped, so
+        it cannot resolve everything. Steam's own search understands official
+        localized titles, which covers exactly that gap. Neither is a superset
+        of the other, so the results are merged and ranked together.
 
         Args:
             text: Raw user supplied game name.
 
         Returns:
-            A tuple of the candidates and whether the result came from the
-            degraded fallback path.
+            A tuple of the candidates and whether Heybox was unavailable.
         """
+        candidates: list[GameCandidate] = []
+        degraded = False
         try:
-            return await self.heybox.search(text), False
+            candidates = await self.heybox.search(text)
         except SteamApiError as exc:
             logger.warning(f"Heybox search failed, falling back to Steam search: {exc}")
+            degraded = True
 
         try:
-            return await self.search.search(text), True
+            candidates += await self.search.search(text)
         except SteamApiError as exc:
-            logger.warning(f"Steam search fallback also failed: {exc}")
-            return [], True
+            logger.warning(f"Steam search also failed: {exc}")
+
+        return _dedupe_candidates(candidates), degraded
 
     async def _attach_steam_names(self, candidates: list[GameCandidate]) -> list[GameCandidate]:
         """Fill in each candidate's Steam storefront name.

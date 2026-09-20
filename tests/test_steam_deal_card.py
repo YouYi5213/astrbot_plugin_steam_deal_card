@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,7 +85,11 @@ from astrbot_plugin_steam_deal_card.service import (  # noqa: E402
     extract_appid,
 )
 from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
+    HeyboxClient,
+    SteamApiError,
+    SteamSearchClient,
     _format_history_date,
+    _is_synthetic_appid,
     _parse_discount_end,
     _parse_specials_page,
     build_deal_item,
@@ -726,6 +731,26 @@ class DescriptionAndLinkTests(unittest.TestCase):
         png = render_game_card(self._card("第一句。第二句。第三句。" * 8))
         self.assertTrue(png.startswith(b"\x89PNG"))
 
+    def test_a_description_with_literal_newlines_renders(self) -> None:
+        # 崩坏3's short_description arrives from the store API with embedded
+        # newlines, and Pillow refuses to measure multiline text, so the card
+        # crashed for it. Whitespace has to be collapsed before measuring.
+        for text in (
+            "第一行\n第二行",
+            "第一行\r\n第二行",
+            "第一行\t第二行",
+            "  前后都有空白  \n\n",
+            "段一\n\n段二\n段三" * 5,
+        ):
+            with self.subTest(text=text):
+                png = render_game_card(self._card(text))
+                self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_a_multiline_name_does_not_crash_the_card(self) -> None:
+        # The name is truncated rather than wrapped, but it gets measured too.
+        png = render_game_card(self._card("desc", name="很长的\n游戏\n名字" * 6))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
     def test_card_renders_for_every_price_shape(self) -> None:
         for card in (
             self._card("desc"),
@@ -1173,6 +1198,185 @@ class PlayerCountTests(unittest.TestCase):
         }
         entry = asyncio.run(_service(_StubStore([], {730: 1}, items)).player_count(730))
         self.assertTrue(entry.capsule_urls)
+
+
+class SyntheticAppidTests(unittest.TestCase):
+    """Heybox hands out its own ids for games it has no Steam id for.
+
+    Those ids never exist on Steam, so trusting them makes a resolvable game
+    look missing. The motivating case is 崩坏3, which is 1668940 on Steam but
+    900045980 on Heybox.
+    """
+
+    class _Client:
+        def __init__(self, games):
+            self._games = games
+
+        async def get(self, url, params=None, **kwargs):  # noqa: ANN001, ANN201
+            payload = {"result": {"games": self._games}}
+
+            class _R:
+                status_code = 200
+                text = ""
+
+                @staticmethod
+                def raise_for_status():
+                    return None
+
+                @staticmethod
+                def json():
+                    return payload
+
+            return _R()
+
+    def _search(self, games):
+        return asyncio.run(HeyboxClient(self._Client(games)).search("x"))
+
+    def test_synthetic_ids_are_recognised(self) -> None:
+        # PC/console placeholders are 9 digits; real Steam ids are ~4 million.
+        self.assertTrue(_is_synthetic_appid(900045980))
+        self.assertTrue(_is_synthetic_appid(900017301))
+        self.assertFalse(_is_synthetic_appid(1668940))
+        self.assertFalse(_is_synthetic_appid(105600))
+
+    def test_a_synthetic_pc_row_is_dropped(self) -> None:
+        # Exactly the 崩坏3 shape: PC game row whose only id is synthetic.
+        rows = [
+            {
+                "name": "Honkai Impact 3rd",
+                "steam_appid": 900045980,
+                "game_type": "pc",
+                "type": "game",
+                "follow_num": 185,
+            }
+        ]
+        self.assertEqual(self._search(rows), [])
+
+    def test_a_real_pc_row_survives(self) -> None:
+        rows = [
+            {
+                "name": "泰拉瑞亚",
+                "steam_appid": 105600,
+                "game_type": "pc",
+                "type": "game",
+                "follow_num": 758848,
+            }
+        ]
+        found = self._search(rows)
+        self.assertEqual([c.appid for c in found], [105600])
+
+    def test_a_real_row_is_kept_alongside_a_synthetic_one(self) -> None:
+        rows = [
+            {"name": "A", "steam_appid": 900017301, "game_type": "pc", "type": "game"},
+            {"name": "B", "steam_appid": 292030, "game_type": "pc", "type": "game"},
+        ]
+        self.assertEqual([c.appid for c in self._search(rows)], [292030])
+
+    def test_non_pc_and_non_game_rows_are_still_dropped(self) -> None:
+        rows = [
+            {"name": "Mobile", "steam_appid": 99935083, "game_type": "mobile"},
+            {"name": "Console", "steam_appid": 105600, "game_type": "console"},
+            {"name": "OST", "steam_appid": 105600, "game_type": "pc", "type": "ost"},
+            {"name": "Game", "steam_appid": 105600, "game_type": "pc", "type": "game"},
+        ]
+        self.assertEqual([c.appid for c in self._search(rows)], [105600])
+
+    def test_junk_rows_do_not_crash(self) -> None:
+        rows = ["junk", None, 5, {"name": "no id", "game_type": "pc"}]
+        self.assertEqual(self._search(rows), [])
+
+
+class SteamSearchFallbackTests(unittest.TestCase):
+    """The JSON search endpoint only exists on the global host.
+
+    When that host is unreachable the search results endpoint still answers from
+    the China host, which is what makes 崩坏3 resolvable on a mainland server.
+    """
+
+    class _Client:
+        """Serves the two endpoints, and fails the global host on demand."""
+
+        RESULTS_HTML = (
+            '<a href="https://store.steampowered.com/app/1668940/3/" '
+            'class="search_result_row ds_collapse_flag" data-ds-appid="1668940">'
+            '<span class="title">崩坏3</span></a>'
+        )
+
+        def __init__(
+            self, json_ok=True, global_results_ok=True, json_items=None, results_html=None
+        ):
+            self.json_ok = json_ok
+            self.global_results_ok = global_results_ok
+            self.json_items = (
+                [{"id": 1668940, "name": "崩坏3"}] if json_items is None else json_items
+            )
+            self.results_html = self.RESULTS_HTML if results_html is None else results_html
+            self.urls = []
+
+        async def get(self, url, params=None, **kwargs):  # noqa: ANN001, ANN201
+            target = str(url)
+            self.urls.append(target)
+            # The China host always answers the results endpoint; that is the
+            # whole point of the fallback.
+            china = "store.steamchina.com" in target
+            if "api/storesearch" in target:
+                if not self.json_ok:
+                    raise httpx.ConnectTimeout("")
+                payload = {"total": len(self.json_items), "items": self.json_items}
+            else:
+                if not china and not self.global_results_ok:
+                    raise httpx.ConnectTimeout("")
+                payload = {"success": 1, "results_html": self.results_html}
+
+            class _R:
+                status_code = 200
+                text = ""
+
+                @staticmethod
+                def raise_for_status():
+                    return None
+
+                @staticmethod
+                def json():
+                    return payload
+
+            return _R()
+
+    def test_the_json_endpoint_is_used_first(self) -> None:
+        client = self._Client()
+        found = asyncio.run(SteamSearchClient(client).search("崩坏3"))
+        self.assertEqual([c.appid for c in found], [1668940])
+        self.assertTrue(any("api/storesearch" in u for u in client.urls))
+
+    def test_it_falls_back_to_the_results_endpoint(self) -> None:
+        # The global storefront is down entirely, which is the real condition
+        # on the mainland server; the China host still resolves the game.
+        client = self._Client(json_ok=False, global_results_ok=False)
+        found = asyncio.run(SteamSearchClient(client).search("崩坏3"))
+        self.assertEqual([c.appid for c in found], [1668940])
+        self.assertTrue(any("/search/results/" in u for u in client.urls))
+        self.assertTrue(any("store.steamchina.com" in u for u in client.urls))
+
+    def test_an_empty_json_answer_is_not_taken_as_final(self) -> None:
+        # The JSON index is narrower than the results one, so an empty answer
+        # from it must not stop the search.
+        client = self._Client(json_items=[])
+        found = asyncio.run(SteamSearchClient(client).search("只狼"))
+        self.assertEqual([c.appid for c in found], [1668940])
+        self.assertTrue(any("/search/results/" in u for u in client.urls))
+
+    def test_no_results_anywhere_is_an_empty_answer_not_an_error(self) -> None:
+        client = self._Client(json_items=[], results_html="")
+        found = asyncio.run(SteamSearchClient(client).search("不存在"))
+        self.assertEqual(found, [])
+
+    def test_both_failing_raises(self) -> None:
+        class _Dead:
+            async def get(self, url, params=None, **kwargs):  # noqa: ANN001, ANN201
+                raise httpx.ConnectTimeout("")
+
+        with self.assertRaises(SteamApiError):
+            asyncio.run(SteamSearchClient(_Dead()).search("崩坏3"))
 
 
 if __name__ == "__main__":
