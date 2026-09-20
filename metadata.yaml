@@ -3,5 +3,5 @@ display_name: Steam 游戏价格卡片
 desc: 无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，并列出当前促销游戏。
 short_desc: 图片查询 Steam 当前价、史低、评价与打折列表。
 author: YouYi5213
-version: 1.0.4
+version: 1.0.5
 repo: https://github.com/YouYi5213/astrbot_plugin_steam_deal_card

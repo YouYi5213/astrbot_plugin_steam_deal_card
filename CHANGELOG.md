@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.5
+
+- 修复图片发不出去：命令已命中、图片也已生成，但发送阶段报
+  `OSError: [Errno 36] File name too long: '/AstrBot/base64:/iVBOR...'`。
+  原因是 `event.image_result()` 会把参数当作媒体地址去解析，
+  `base64://` 被当成本地路径。改为自行构造
+  `Comp.Image(file="base64://…")` 并走 `chain_result`，
+  与同环境其它插件验证过的写法一致。
+
 ## 1.0.4
 
 - 修复 `steam打折` 在国内服务器上间歇性失败：特惠列表所在主机是**时通时断**

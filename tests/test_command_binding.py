@@ -15,6 +15,7 @@ commands are registered as regex filters.
 from __future__ import annotations
 
 import ast
+import base64
 import sys
 import types
 import unittest
@@ -97,6 +98,20 @@ def _install_astrbot_stub() -> None:
 
     star_mod.register = _register
 
+    class _Image:
+        """Minimal stand-in for the real image component.
+
+        Only the ``file`` keyword matters here: the real component treats a
+        ``base64://`` value in that slot as inline data rather than a path.
+        """
+
+        def __init__(self, **kwargs):
+            self.file = kwargs.get("file", "")
+
+    components_mod = types.ModuleType("astrbot.api.message_components")
+    components_mod.Image = _Image
+    api.message_components = components_mod
+
     root = types.ModuleType("astrbot")
     root.api = api
 
@@ -104,6 +119,7 @@ def _install_astrbot_stub() -> None:
     sys.modules["astrbot.api"] = api
     sys.modules["astrbot.api.event"] = event_mod
     sys.modules["astrbot.api.star"] = star_mod
+    sys.modules["astrbot.api.message_components"] = components_mod
 
 
 _install_astrbot_stub()
@@ -175,6 +191,64 @@ class WakePrefixContractTests(unittest.TestCase):
             ),
             "main.py must not use `from __future__ import annotations`",
         )
+
+
+class ImageDeliveryTests(unittest.TestCase):
+    """Images must ride the ``file`` field, not the resolver path."""
+
+    def test_no_handler_uses_image_result(self) -> None:
+        # event.image_result() resolves its argument as a media URL; handing it
+        # a base64 payload produced "/AstrBot/base64:/iVBOR..." and
+        # "[Errno 36] File name too long" when the chain was sent.
+        offenders = [
+            ast.unparse(node)
+            for node in ast.walk(_MODULE)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "image_result"
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_handlers_delegate_to_the_shared_helper(self) -> None:
+        calls = [
+            node
+            for node in ast.walk(_MODULE)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_image_result"
+        ]
+        # One deals handler, one game card, one candidate list.
+        self.assertEqual(len(calls), 3)
+
+    def test_helper_builds_a_base64_image_component(self) -> None:
+        helper = next(
+            node
+            for node in ast.walk(_MODULE)
+            if isinstance(node, ast.FunctionDef) and node.name == "_image_result"
+        )
+        source = ast.unparse(helper)
+        self.assertIn("chain_result", source)
+        self.assertIn("Comp.Image", source)
+        self.assertIn("base64://", source)
+
+    def test_helper_returns_a_real_component(self) -> None:
+        class _Event:
+            def chain_result(self, chain):
+                return chain
+
+        image = plugin_main._image_result(_Event(), b"\x89PNG\x00")
+        self.assertEqual(len(image), 1)
+        self.assertTrue(image[0].file.startswith("base64://"))
+        self.assertEqual(base64.b64decode(image[0].file[len("base64://") :]), b"\x89PNG\x00")
+
+    def test_message_components_are_imported(self) -> None:
+        imported = {
+            alias.name
+            for node in ast.walk(_MODULE)
+            if isinstance(node, ast.ImportFrom) and node.module == "astrbot.api"
+            for alias in node.names
+        }
+        self.assertIn("message_components", imported)
 
 
 class CommandRegexTests(unittest.TestCase):

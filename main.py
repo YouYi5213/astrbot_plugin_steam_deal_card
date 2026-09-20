@@ -7,6 +7,7 @@ import time
 
 import httpx
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api import message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
@@ -15,7 +16,7 @@ from .service import LookupError, SteamDealService
 from .steam_api import HeyboxClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.0.4"
+PLUGIN_VERSION = "1.0.5"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，并列出当前促销游戏。"
@@ -220,7 +221,7 @@ class SteamDealCardPlugin(Star):
             yield event.plain_result(f"获取折扣失败：{exc}")
             return
 
-        yield event.image_result(_to_data_url(image))
+        yield _image_result(event, image)
 
     async def _render_game(self, event: AstrMessageEvent, appid: int):
         """Fetch and render one game by appid.
@@ -258,7 +259,7 @@ class SteamDealCardPlugin(Star):
             logger.warning(f"Steam card render failed, falling back to text: {exc}")
             yield event.plain_result(_card_as_text(card))
             return
-        yield event.image_result(_to_data_url(image))
+        yield _image_result(event, image)
 
     async def _render_candidates(
         self,
@@ -290,7 +291,7 @@ class SteamDealCardPlugin(Star):
             lines.append(f"回复：{command} <序号>")
             yield event.plain_result("\n".join(lines))
             return
-        yield event.image_result(_to_data_url(image))
+        yield _image_result(event, image)
 
     def _store_pending(self, session: str, candidates: tuple[GameCandidate, ...]) -> None:
         """Remember a disambiguation list for the next user reply.
@@ -338,16 +339,23 @@ class SteamDealCardPlugin(Star):
             self._pending.pop(key, None)
 
 
-def _to_data_url(image: bytes) -> str:
-    """Encode PNG bytes as a base64 data URL.
+def _image_result(event: AstrMessageEvent, image: bytes):
+    """Build an image result the aiocqhttp adapter can actually send.
+
+    ``event.image_result()`` routes the string through the media resolver,
+    which treats a ``base64://`` payload as a local path and fails with
+    "File name too long". Building the component ourselves keeps the payload
+    in the ``file`` field, which is the slot that understands the scheme.
 
     Args:
+        event: The incoming message event.
         image: PNG image bytes.
 
     Returns:
-        A ``base64://`` URL accepted by the AstrBot image component.
+        A message chain result carrying one base64 image.
     """
-    return "base64://" + base64.b64encode(image).decode("ascii")
+    encoded = base64.b64encode(image).decode("ascii")
+    return event.chain_result([Comp.Image(file=f"base64://{encoded}")])
 
 
 def _card_as_text(card: GameCard) -> str:
