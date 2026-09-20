@@ -655,6 +655,8 @@ def render_game_card(card: GameCard, capsule: bytes | None = None) -> bytes:
             )
 
     footer_y = height - PADDING - 18
+    # Kept on the card so a screenshot stays self-contained; the handler also
+    # sends it as text, because a URL inside an image cannot be tapped.
     link_label = "商店链接："
     link_font = _font(19)
     draw.text((PADDING, footer_y), link_label, font=link_font, fill=TEXT_FAINT)

@@ -18,7 +18,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -340,7 +340,8 @@ class SteamDealCardPlugin(Star):
             card: The game card to render.
 
         Yields:
-            An image result, or a text fallback when rendering fails.
+            An image result plus a text message carrying the store link, or a
+            text fallback when rendering fails.
         """
         try:
             image = await self.service.render_game(card)
@@ -349,6 +350,9 @@ class SteamDealCardPlugin(Star):
             yield event.plain_result(_card_as_text(card))
             return
         yield _image_result(event, image)
+        # A URL drawn inside an image cannot be tapped, so the link is sent as
+        # its own text message where the client can make it clickable.
+        yield event.plain_result(f"{card.name}：{card.store_url}")
 
     async def _render_candidates(
         self,

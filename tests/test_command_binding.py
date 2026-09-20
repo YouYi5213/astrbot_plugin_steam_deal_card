@@ -15,6 +15,7 @@ commands are registered as regex filters.
 from __future__ import annotations
 
 import ast
+import asyncio
 import base64
 import sys
 import types
@@ -479,6 +480,68 @@ class CommandRegistrationTests(unittest.TestCase):
             self.assertIn(name, plugin_main._GAME_COMMANDS)
         for name in (DEALS, DEALS2):
             self.assertIn(name, plugin_main._DEALS_COMMANDS)
+
+
+class StoreLinkDeliveryTests(unittest.TestCase):
+    """A URL drawn inside an image cannot be tapped.
+
+    Drawing the link on the card is not enough: the user would have to retype
+    it. The link must also be sent as a text message, which clients turn into a
+    clickable link.
+    """
+
+    def test_card_handler_emits_a_text_link(self) -> None:
+        source = MAIN_SOURCE
+        # The link message is built from the card's own store_url.
+        self.assertIn("card.store_url", source)
+
+    def test_link_text_is_a_separate_plain_result(self) -> None:
+        plugin = plugin_main
+        card = plugin.GameCard(
+            appid=105600,
+            name="Terraria",
+            price=None,
+            reviews=None,
+        )
+        self.assertTrue(card.store_url.endswith("/app/105600/"))
+
+        class _Event:
+            def plain_result(self, text):
+                return ("text", text)
+
+            def chain_result(self, chain):
+                return ("chain", chain)
+
+        async def _fake_render(_card):
+            return b"\x89PNG\r\n\x1a\n"
+
+        async def drive():
+            handler = plugin.SteamDealCardPlugin.__new__(plugin.SteamDealCardPlugin)
+
+            class _Svc:
+                render_game = staticmethod(_fake_render)
+
+            handler.service = _Svc()
+            out = []
+            async for result in handler._render_card(_Event(), card):
+                out.append(result)
+            return out
+
+        results = asyncio.run(drive())
+        kinds = [r[0] for r in results]
+        self.assertIn("chain", kinds, "the image must still be sent")
+        self.assertIn("text", kinds, "the link must be sent as clickable text")
+        # Both an image and the link, in that order.
+        self.assertEqual(kinds, ["chain", "text"])
+        self.assertIn("Terraria", results[1][1])
+        self.assertIn(card.store_url, results[1][1])
+
+    def test_render_failure_still_includes_the_link(self) -> None:
+        # The text fallback already carries the URL, so nothing is lost.
+        plugin = plugin_main
+        card = plugin.GameCard(105600, "Terraria", None, None)
+        text = plugin._card_as_text(card)
+        self.assertIn(card.store_url, text)
 
 
 class MetadataTests(unittest.TestCase):
