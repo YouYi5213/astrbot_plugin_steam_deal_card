@@ -47,11 +47,8 @@ STEAM_SEARCH_BASES = (
 )
 STEAM_SEARCH_PATH = "/search/results/"
 STEAM_SEARCH_RESULTS_URL = STEAM_SEARCH_BASES[0] + STEAM_SEARCH_PATH
-# The 热门新品 ranking lives only on this server-rendered page. No search
-# parameter combination reproduces it; see popular_new.
-STEAM_EXPLORE_NEW_URL = "https://store.steampowered.com/explore/new/"
-# The home page carries both shelves inline, so one request serves the
-# 热门新品 and 热门即将推出 commands. It is fetched from STEAM_SEARCH_BASES.
+# The home page carries the 热门即将推出 shelf inline, so no extra endpoint is
+# involved. It is fetched from STEAM_SEARCH_BASES.
 STEAM_FEATURED_CATEGORIES_URL = "https://store.steampowered.com/api/featuredcategories/"
 # JSON storefront search, used only as a Heybox outage fallback. The older
 # /search/suggest endpoint returns HTML and no longer answers JSON, so this is
@@ -84,17 +81,14 @@ _CAPSULE_RE = re.compile(r'<div class="search_capsule">\s*<img src="([^"]+)"')
 _DISCOUNT_RE = re.compile(r'data-discount="(\d+)"')
 _FINAL_RE = re.compile(r'discount_final_price">([^<]*)<')
 _ORIGINAL_RE = re.compile(r'discount_original_price">([^<]*)<')
-# The explore page nests its rows in tab_item anchors whose attributes carry
-# the appid, so both the opening tag and the body are needed.
-_TAB_ITEM_RE = re.compile(r'<a\b[^>]*class="tab_item[^"]*"[^>]*>(.*?)</a>', re.DOTALL)
-_TAB_NAME_RE = re.compile(r'tab_item_name">([^<]+)<')
-_TAB_CAP_RE = re.compile(r'tab_item_cap_img"[^>]*src="([^"]+)"')
-_TAB_DISCOUNT_RE = re.compile(r'data-discount="(\d+)"')
-# Home page shelves use tab_row_item rows, which differ from the explore page.
+# Home page shelves nest their rows in tab_row_item anchors. Attributes such
+# as the appid sit on the opening tag, so both the tag and the body are needed.
 _TAB_ROW_RE = re.compile(r'<a\b[^>]*class="tab_row_item"[^>]*>(.*?)</a>', re.DOTALL)
 _TAB_TITLE_RE = re.compile(r'tab_item_title">([^<]+)<')
+# Capsule art is lazy loaded: src is a placeholder and the real URL sits here.
 _TAB_ROW_CAP_RE = re.compile(r'data-delayed-image="([^"]+)"')
 _TAB_DATE_RE = re.compile(r'tab_item_release_date">([^<]*)<')
+_TAB_DISCOUNT_RE = re.compile(r'data-discount="(\d+)"')
 
 
 class SteamApiError(RuntimeError):
@@ -351,24 +345,25 @@ class SteamStoreClient:
         }
         return await self._search_json(params, "Steam 特惠列表")
 
-    async def home_shelves(self, country: str = "CN") -> dict[str, list[dict[str, Any]]]:
-        """Fetch the storefront home page's 热门新品 and 热门即将推出 shelves.
+    async def home_shelf(self, anchor: str, country: str = "CN") -> list[dict[str, Any]]:
+        """Read one shelf from the storefront home page.
 
-        Both shelves are inline in the home page document, so a single request
-        serves both commands. They are keyed by the tab ids the page itself
-        uses, and are the lists the store shows when you scroll the home page.
+        The shelves are inline in the home page document, so no extra endpoint
+        is involved. Both storefront hosts serve them, but the China one draws
+        on a much smaller catalogue, so it is only used when the global host
+        fails to answer.
 
         Args:
+            anchor: Container id, such as ``tab_upcoming_content``.
             country: Steam storefront country code.
 
         Returns:
-            Mapping of shelf key (``new`` / ``upcoming``) to row dicts.
+            Row dicts in the order the store displays them.
 
         Raises:
-            SteamApiError: If the home page cannot be fetched on either host.
+            SteamApiError: If no host answered the home page request.
         """
         last_error = "unknown"
-        empty = {"new": [], "upcoming": []}
         for base in STEAM_SEARCH_BASES:
             try:
                 response = await self.client.get(
@@ -381,43 +376,15 @@ class SteamStoreClient:
                 last_error = _describe_error(exc)
                 continue
 
-            shelves = {
-                "new": parse_home_shelf(page, "tab_newreleases_content"),
-                "upcoming": parse_home_shelf(page, "tab_upcoming_content"),
-            }
-            if shelves["new"] or shelves["upcoming"]:
-                # Both storefronts serve these shelves, but the China one draws
-                # on a much smaller catalogue, so record when it had to be used.
+            rows = parse_home_shelf(page, anchor)
+            if rows:
                 if base != STEAM_SEARCH_BASES[0]:
-                    self.last_fallback_reason = f"已改用 {base}"
-                return shelves
+                    self.last_fallback_reason = base
+                return rows
 
         if last_error != "unknown":
             raise SteamApiError(f"Steam 商店首页请求失败：{last_error}")
-        return empty
-
-    async def popular_new(self, country: str = "CN", limit: int = 10) -> list[dict[str, Any]]:
-        """Fetch Steam's 热门新品 (popular new releases).
-
-        This is the shelf the store shows on its home page and on
-        ``/explore/new/``. It is not reachable through the search endpoint:
-        every ``filter``/``sort_by`` combination was measured against the shelf
-        and overlapped it on 0 of 10 rows. The ``popularnew`` search filter in
-        particular ranks by overall popularity and returns long-lived games
-        such as CS2 and GTA V rather than new releases.
-
-        Args:
-            country: Steam storefront country code.
-            limit: Maximum number of entries to return.
-
-        Returns:
-            Row dicts with appid, name, capsule, price text and release date.
-
-        Raises:
-            SteamApiError: If the shelf cannot be fetched.
-        """
-        shelves = await self.home_shelves(country)
-        return shelves["new"][: max(limit, 1)]
+        return []
 
     async def popular_upcoming(self, country: str = "CN", limit: int = 10) -> list[dict[str, Any]]:
         """Fetch Steam's 热门即将推出 (popular upcoming) shelf.
@@ -438,8 +405,8 @@ class SteamStoreClient:
         Raises:
             SteamApiError: If the shelf cannot be fetched.
         """
-        shelves = await self.home_shelves(country)
-        return shelves["upcoming"][: max(limit, 1)]
+        rows = await self.home_shelf("tab_upcoming_content", country)
+        return rows[: max(limit, 1)]
 
     async def _search_json(self, params: dict[str, Any], what: str) -> dict[str, Any]:
         """Request a storefront search page, retrying hosts until one answers.
@@ -744,49 +711,6 @@ def parse_home_shelf(page: str, anchor: str) -> list[dict[str, Any]]:
                 if original_match
                 else "",
                 "release": html.unescape(date_match.group(1)).strip() if date_match else "",
-            }
-        )
-    return rows
-
-
-def parse_explore_tab_items(page: str) -> list[dict[str, Any]]:
-    """Extract game rows from the ``/explore/new/`` page.
-
-    Every attribute sits on the opening ``<a>`` tag, so the whole tag has to be
-    matched rather than just the element body. The page ships both the 热门新品
-    and 新品 tabs in one document; they are returned in document order, which is
-    the order the store displays them in.
-
-    Args:
-        page: Raw HTML of the explore page.
-
-    Returns:
-        Row dicts with appid, name, capsule, discount and price text.
-    """
-    rows: list[dict[str, Any]] = []
-    for match in _TAB_ITEM_RE.finditer(page):
-        tag, body = match.group(0), match.group(1)
-        appid_match = _APPID_RE.search(tag)
-        name_match = _TAB_NAME_RE.search(body)
-        if not appid_match or not name_match:
-            continue
-        # Bundles carry a comma separated appid list and have no single price.
-        if "," in appid_match.group(1):
-            continue
-        capsule_match = _TAB_CAP_RE.search(body)
-        discount_match = _TAB_DISCOUNT_RE.search(body)
-        final_match = _FINAL_RE.search(body)
-        original_match = _ORIGINAL_RE.search(body)
-        rows.append(
-            {
-                "appid": int(appid_match.group(1)),
-                "name": html.unescape(name_match.group(1)).strip(),
-                "capsule": capsule_match.group(1) if capsule_match else "",
-                "discount": int(discount_match.group(1)) if discount_match else 0,
-                "final": html.unescape(final_match.group(1)).strip() if final_match else "",
-                "original": html.unescape(original_match.group(1)).strip()
-                if original_match
-                else "",
             }
         )
     return rows

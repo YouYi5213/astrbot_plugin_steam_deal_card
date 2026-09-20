@@ -447,11 +447,10 @@ class HealthProbeTests(unittest.TestCase):
 
 
 class HomeShelfTests(unittest.TestCase):
-    """The home page's 热门新品 and 热门即将推出 shelves.
+    """The home page's 热门即将推出 shelf.
 
-    Both are inline in one document, so a single request serves both commands.
-    They are the lists the store itself shows, and no search parameter
-    combination reproduces them.
+    It is inline in the home page document, so no extra endpoint is involved,
+    and it is the list the store itself shows when you scroll the home page.
     """
 
     # Markup mirrors the real page: tab_row_item rows, a lazy loaded capsule,
@@ -459,26 +458,22 @@ class HomeShelfTests(unittest.TestCase):
     PAGE = (
         '<div id="tab_newreleases_content">'
         '<a class="tab_row_item" data-ds-appid="3058360" href="x">'
-        '<img class="tab_row_capsule" src="https://cdn/trans.gif" '
-        'data-delayed-image="https://cdn/3058360/cap.jpg" alt="A">'
-        '<div class="tab_item_title">\u6cd5\u56fd\u5c0f\u9986\u513f</div>'
-        '<div class="tab_item_release_date">'
-        "\u53d1\u884c\u4e8e: 2026 \u5e74 9 \u6708 18 \u65e5</div>"
-        '<div class="discount_block" data-discount="52">'
-        '<div class="discount_original_price">\u00a580.10</div>'
-        '<div class="discount_final_price">\u00a538.34</div></div></a>'
-        '<a class="tab_row_item" data-ds-appid="730" href="x">'
-        '<div class="tab_item_title">Full Price Game</div>'
-        '<div class="discount_block" data-discount="0">'
-        '<div class="discount_final_price">\u00a533.00</div></div></a>'
+        '<div class="tab_item_title">\u6cd5\u56fd\u5c0f\u9986\u513f</div></a>'
         "</div>"
         '<div id="tab_upcoming_content">'
         '<a class="tab_row_item" data-ds-appid="4705510" href="x">'
-        '<img class="tab_row_capsule" data-delayed-image="https://cdn/4705510/c.jpg">'
+        '<img class="tab_row_capsule" src="https://cdn/trans.gif" '
+        'data-delayed-image="https://cdn/4705510/c.jpg" alt="H">'
         '<div class="tab_item_title">Happy Wheels</div>'
         '<div class="tab_item_release_date">'
         "\u53d1\u884c\u65e5\u671f: 2026 \u5e74 9 \u6708 21 \u65e5</div>"
-        "</a></div>"
+        '<div class="discount_block" data-discount="0">'
+        '<div class="discount_final_price">\u00a568.00</div></div></a>'
+        '<a class="tab_row_item" data-ds-appid="4358690" href="x">'
+        '<div class="tab_item_title">\u5b88\u5893\u4eba2</div>'
+        '<div class="tab_item_release_date">'
+        "\u53d1\u884c\u65e5\u671f: 2026 \u5e74 9 \u6708 22 \u65e5</div></a>"
+        "</div>"
         '<div id="tab_other_content"></div>'
     )
 
@@ -497,48 +492,35 @@ class HomeShelfTests(unittest.TestCase):
 
         return _C()
 
-    def test_new_reads_the_home_page(self) -> None:
+    def test_upcoming_reads_the_home_page(self) -> None:
         client = self._client()
-        rows = asyncio.run(SteamStoreClient(client).popular_new("CN", 10))
+        rows = asyncio.run(SteamStoreClient(client).popular_upcoming("CN", 10))
         self.assertTrue(any(u.rstrip("/") == "https://store.steampowered.com" for u in client.urls))
-        self.assertEqual([r["appid"] for r in rows], [3058360, 730])
+        self.assertEqual([r["appid"] for r in rows], [4705510, 4358690])
 
-    def test_new_parses_price_capsule_and_release(self) -> None:
-        rows = asyncio.run(SteamStoreClient(self._client()).popular_new("CN", 10))
+    def test_upcoming_parses_capsule_price_and_release(self) -> None:
+        rows = asyncio.run(SteamStoreClient(self._client()).popular_upcoming("CN", 10))
         first = rows[0]
-        self.assertEqual(first["name"], "\u6cd5\u56fd\u5c0f\u9986\u513f")
-        self.assertEqual(first["final"], "\u00a538.34")
-        self.assertEqual(first["discount"], 52)
+        self.assertEqual(first["name"], "Happy Wheels")
+        self.assertEqual(first["final"], "\u00a568.00")
         # The capsule is lazy loaded, so src is a placeholder and the real URL
         # lives in data-delayed-image.
-        self.assertEqual(first["capsule"], "https://cdn/3058360/cap.jpg")
+        self.assertEqual(first["capsule"], "https://cdn/4705510/c.jpg")
         self.assertIn("2026", first["release"])
+        self.assertIn("21", first["release"])
 
-    def test_new_keeps_full_price_rows(self) -> None:
-        rows = asyncio.run(SteamStoreClient(self._client()).popular_new("CN", 10))
-        self.assertEqual(rows[1]["discount"], 0)
-        self.assertEqual(rows[1]["final"], "\u00a533.00")
-
-    def test_upcoming_reads_its_own_container(self) -> None:
-        # The two shelves share a page, so each must read only its own section.
+    def test_upcoming_reads_only_its_own_container(self) -> None:
+        # The page carries other tabs, so the wrong container must not leak in.
         rows = asyncio.run(SteamStoreClient(self._client()).popular_upcoming("CN", 10))
-        self.assertEqual([r["appid"] for r in rows], [4705510])
-        self.assertIn("21", rows[0]["release"])
-
-    def test_shelves_do_not_leak_into_each_other(self) -> None:
-        client = self._client()
-        new = asyncio.run(SteamStoreClient(client).popular_new("CN", 10))
-        up = asyncio.run(SteamStoreClient(client).popular_upcoming("CN", 10))
-        self.assertNotIn(4705510, [r["appid"] for r in new])
-        self.assertNotIn(3058360, [r["appid"] for r in up])
+        self.assertNotIn(3058360, [r["appid"] for r in rows])
 
     def test_the_limit_is_respected(self) -> None:
-        rows = asyncio.run(SteamStoreClient(self._client()).popular_new("CN", 1))
-        self.assertEqual(len(rows), 1)
+        rows = asyncio.run(SteamStoreClient(self._client()).popular_upcoming("CN", 1))
+        self.assertEqual([r["appid"] for r in rows], [4705510])
 
     def test_duplicate_rows_keep_their_first_position(self) -> None:
         page = (
-            '<div id="tab_newreleases_content">'
+            '<div id="tab_upcoming_content">'
             '<a class="tab_row_item" data-ds-appid="5" href="x">'
             '<div class="tab_item_title">First</div></a>'
             '<a class="tab_row_item" data-ds-appid="7" href="x">'
@@ -547,28 +529,28 @@ class HomeShelfTests(unittest.TestCase):
             '<div class="tab_item_title">First again</div></a>'
             "</div>"
         )
-        rows = asyncio.run(SteamStoreClient(self._client(page)).popular_new("CN", 10))
+        rows = asyncio.run(SteamStoreClient(self._client(page)).popular_upcoming("CN", 10))
         self.assertEqual([r["appid"] for r in rows], [5, 7])
 
     def test_bundles_are_skipped(self) -> None:
         page = (
-            '<div id="tab_newreleases_content">'
+            '<div id="tab_upcoming_content">'
             '<a class="tab_row_item" data-ds-appid="100,200" href="x">'
             '<div class="tab_item_title">Bundle</div></a>'
             '<a class="tab_row_item" data-ds-appid="300" href="x">'
             '<div class="tab_item_title">Real Game</div></a>'
             "</div>"
         )
-        rows = asyncio.run(SteamStoreClient(self._client(page)).popular_new("CN", 10))
+        rows = asyncio.run(SteamStoreClient(self._client(page)).popular_upcoming("CN", 10))
         self.assertEqual([r["appid"] for r in rows], [300])
 
     def test_a_missing_container_yields_nothing(self) -> None:
         client = self._client("<html></html>")
-        self.assertEqual(asyncio.run(SteamStoreClient(client).popular_new("CN", 10)), [])
+        self.assertEqual(asyncio.run(SteamStoreClient(client).popular_upcoming("CN")), [])
 
     def test_the_home_page_fails_over_to_the_second_host(self) -> None:
         # The global storefront drops out intermittently; the China one serves
-        # the same shelves from a smaller catalogue.
+        # the same shelf from a smaller catalogue.
         page = self.PAGE
         seen: list[str] = []
 
@@ -580,20 +562,18 @@ class HomeShelfTests(unittest.TestCase):
                 return _FakeResponse({}, text=page)
 
         store = SteamStoreClient(_C())
-        rows = asyncio.run(store.popular_new("CN", 10))
-        self.assertEqual([r["appid"] for r in rows], [3058360, 730])
+        rows = asyncio.run(store.popular_upcoming("CN", 10))
+        self.assertEqual([r["appid"] for r in rows], [4705510, 4358690])
         self.assertTrue(any("store.steamchina.com" in u for u in seen))
         # The caller is expected to say the result came from the smaller site.
-        self.assertIsNotNone(store.last_fallback_reason)
+        self.assertEqual(store.last_fallback_reason, "https://store.steamchina.com")
 
     def test_a_healthy_global_page_reports_no_fallback(self) -> None:
         store = SteamStoreClient(self._client())
-        asyncio.run(store.popular_new("CN", 10))
+        asyncio.run(store.popular_upcoming("CN", 10))
         self.assertIsNone(store.last_fallback_reason)
 
     def test_failures_become_domain_errors(self) -> None:
-        with self.assertRaises(SteamApiError):
-            asyncio.run(SteamStoreClient(self._client(boom=True)).popular_new("CN", 5))
         with self.assertRaises(SteamApiError):
             asyncio.run(SteamStoreClient(self._client(boom=True)).popular_upcoming("CN"))
 

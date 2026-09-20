@@ -232,8 +232,8 @@ class ImageDeliveryTests(unittest.TestCase):
             and node.func.id == "_image_result"
         ]
         # deals, game card, candidate list, single player count, ranking,
-        # popular new, upcoming.
-        self.assertEqual(len(calls), 7)
+        # upcoming.
+        self.assertEqual(len(calls), 6)
 
     def test_every_image_sending_handler_uses_the_helper(self) -> None:
         senders = [
@@ -254,7 +254,6 @@ class ImageDeliveryTests(unittest.TestCase):
                     "steam_deals_command",
                     "steam_players_command",
                     "steam_hot_command",
-                    "steam_new_command",
                     "steam_upcoming_command",
                     "_render_card",
                     "_render_candidates",
@@ -491,28 +490,26 @@ class CommandRegistrationTests(unittest.TestCase):
         for name in (DEALS, DEALS2):
             self.assertIn(name, plugin_main._DEALS_COMMANDS)
 
-    def test_new_and_upcoming_commands_are_registered(self) -> None:
-        self.assertIn("steam热门新品", plugin_main._NEW_COMMANDS)
-        self.assertIn("steam新品", plugin_main._NEW_COMMANDS)
+    def test_upcoming_command_is_registered(self) -> None:
         self.assertIn("steam即将推出", plugin_main._UPCOMING_COMMANDS)
         self.assertIn("steam即将发售", plugin_main._UPCOMING_COMMANDS)
-
-    def test_new_commands_do_not_shadow_each_other(self) -> None:
-        # "steam新品" must not match inside "steam热门新品", or the wrong
-        # handler would win depending on registration order.
-        self.assertTrue(plugin_main._NEW_CMD_RE.match("steam热门新品"))
-        self.assertTrue(plugin_main._NEW_CMD_RE.match("steam新品"))
-        self.assertIsNone(plugin_main._NEW_CMD_RE.match("steam即将推出"))
         self.assertTrue(plugin_main._UPCOMING_CMD_RE.match("steam即将推出"))
-        self.assertIsNone(plugin_main._UPCOMING_CMD_RE.match("steam热门新品"))
+        self.assertIsNone(plugin_main._UPCOMING_CMD_RE.match("steam打折"))
 
-    def test_new_commands_accept_a_count_argument(self) -> None:
+    def test_upcoming_command_accepts_a_count_argument(self) -> None:
         self.assertEqual(
             plugin_main._strip_command(
-                f"{plugin_main._NEW_COMMANDS[0]} 15", plugin_main._NEW_COMMANDS
+                f"{plugin_main._UPCOMING_COMMANDS[0]} 5", plugin_main._UPCOMING_COMMANDS
             ),
-            "15",
+            "5",
         )
+
+    def test_the_popular_new_command_is_gone(self) -> None:
+        # Its shelf turned out to be a plain release-date list rather than a
+        # popularity ranking, so the command was withdrawn.
+        self.assertFalse(hasattr(plugin_main, "_NEW_COMMANDS"))
+        self.assertFalse(hasattr(plugin_main, "_NEW_CMD_RE"))
+        self.assertFalse(hasattr(plugin_main, "steam_new_command"))
         self.assertEqual(
             plugin_main._strip_command(
                 f"{plugin_main._UPCOMING_COMMANDS[0]} 5", plugin_main._UPCOMING_COMMANDS

@@ -281,24 +281,6 @@ class SteamDealService:
             raise LookupError("暂时没有获取到 Steam 折扣游戏。")
         return deals
 
-    async def popular_new(self, limit: int | None = None) -> list[DealItem]:
-        """Fetch Steam's popular new releases.
-
-        Args:
-            limit: Override for the number of games to return.
-
-        Returns:
-            The games, in Steam's own popularity order.
-
-        Raises:
-            LookupError: If the listing cannot be fetched.
-        """
-        wanted = max(limit or self.max_deals, 1)
-        rows = await self.store.popular_new(self.country, limit=wanted)
-        if not rows:
-            raise LookupError("暂时没有获取到 Steam 热门新品。")
-        return await self._enrich_rows(rows, "暂时没有获取到 Steam 热门新品。")
-
     async def popular_upcoming(self, limit: int | None = None) -> list[DealItem]:
         """Fetch Steam's 热门即将推出 shelf.
 
