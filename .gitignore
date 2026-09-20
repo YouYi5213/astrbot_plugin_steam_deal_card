@@ -12,3 +12,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# Scratch output from manually eyeballing rendered cards. The plugin never
+# writes these; they only exist while developing the renderers.
+/_*.png
