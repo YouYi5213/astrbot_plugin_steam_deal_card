@@ -1,5 +1,6 @@
 """AstrBot entry point for the Steam deal card plugin."""
 
+import asyncio
 import base64
 import re
 import ssl
@@ -11,12 +12,13 @@ from astrbot.api import message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+from .health import run_health_check
 from .models import GameCandidate, GameCard
 from .service import LookupError, SteamDealService, extract_appid
-from .steam_api import HeyboxClient, SteamStoreClient
+from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.2.0"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -137,12 +139,29 @@ class SteamDealCardPlugin(Star):
             history_country=str(self.config.get("history_country", "cn")) or "cn",
             max_deals=int(self.config.get("max_deals", 10)),
             max_players=int(self.config.get("max_players", 20)),
+            search=SteamSearchClient(self.http, language=language),
         )
         # session id -> (candidates, expiry timestamp)
         self._pending: dict[str, tuple[tuple[GameCandidate, ...], float]] = {}
+        # Run the probe in the background: a slow network must never delay the
+        # plugin loading, but a broken dependency should still be visible in
+        # the log without waiting for a user to report "no reply".
+        self._health_task = asyncio.create_task(self._run_health_check())
+
+    async def _run_health_check(self) -> None:
+        """Probe the upstream dependencies once, logging the outcome."""
+        try:
+            await run_health_check(self.service.store, self.service.heybox)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a probe must never break loading
+            logger.warning(f"接口自检执行失败：{type(exc).__name__}: {exc}")
 
     async def terminate(self) -> None:
         """Close the shared HTTP client when the plugin unloads."""
+        task = getattr(self, "_health_task", None)
+        if task is not None and not task.done():
+            task.cancel()
         await self.http.aclose()
         logger.info("Steam deal card plugin stopped.")
 

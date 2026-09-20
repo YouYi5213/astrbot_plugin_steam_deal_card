@@ -37,6 +37,10 @@ STEAM_API_BASES = (
 )
 STEAM_GET_ITEMS_URL = STEAM_API_BASES[0] + STEAM_GET_ITEMS_PATH
 STEAM_SEARCH_RESULTS_URL = "https://store.steampowered.com/search/results/"
+# JSON storefront search, used only as a Heybox outage fallback. The older
+# /search/suggest endpoint returns HTML and no longer answers JSON, so this is
+# the reliable structured option. It does not understand Chinese names.
+STEAM_SEARCH_SUGGEST_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_ASSET_BASE = "https://shared.akamai.steamstatic.com/store_item_assets/"
 # Capsule images live at predictable paths, which matters because the China API
 # does not report a main_capsule filename the way the global one does.
@@ -430,6 +434,63 @@ class HeyboxClient:
             recorded_on=_format_history_date(info.get("date")),
             discount_percent=int(info.get("discount") or 0),
         )
+
+
+class SteamSearchClient:
+    """Fallback name resolver backed by the Steam storefront search.
+
+    This exists only to cover a Heybox outage. Steam's own search does not
+    understand Chinese (``泰拉瑞亚`` returns nothing), so it is no replacement
+    for Heybox, but it still resolves English names and therefore keeps the
+    plugin usable in some form while Heybox is down.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, language: str = "schinese") -> None:
+        """Store the shared HTTP client.
+
+        Args:
+            client: Shared async HTTP client.
+            language: Storefront language used for the returned titles.
+        """
+        self.client = client
+        self.language = language
+
+    async def search(self, query: str) -> list[GameCandidate]:
+        """Search the Steam storefront for a game name.
+
+        Args:
+            query: Raw user supplied game name.
+
+        Returns:
+            Candidate games, best match first.
+
+        Raises:
+            SteamApiError: If the endpoint fails.
+        """
+        try:
+            response = await self.client.get(
+                STEAM_SEARCH_SUGGEST_URL,
+                params={"term": query, "l": self.language, "cc": "CN"},
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
+            raise SteamApiError(f"Steam 搜索请求失败：{_describe_error(exc)}") from exc
+
+        # The endpoint answers {"total": n, "items": [{"id", "name", ...}]}.
+        entries = body.get("items") if isinstance(body, dict) else body
+        candidates: list[GameCandidate] = []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            # Accept either spelling: only `id` is documented, but the sibling
+            # endpoints use `appid`.
+            appid = entry.get("id") or entry.get("appid")
+            name = str(entry.get("name") or "").strip()
+            if not isinstance(appid, int) or isinstance(appid, bool) or not name:
+                continue
+            candidates.append(GameCandidate(appid=appid, name=name, source="steam"))
+        return candidates
 
 
 async def download_image(client: httpx.AsyncClient, url: str) -> bytes | None:

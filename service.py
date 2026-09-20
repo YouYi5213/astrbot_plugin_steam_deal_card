@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, replace
 
 import httpx
+from astrbot.api import logger
 
 from .models import DealItem, GameCandidate, GameCard, PlayerCount
 from .name_match import is_confident, rank_candidates
@@ -14,6 +15,7 @@ from .render import render_candidates, render_deals_card, render_game_card, rend
 from .steam_api import (
     HeyboxClient,
     SteamApiError,
+    SteamSearchClient,
     SteamStoreClient,
     build_deal_item,
     build_game_card,
@@ -88,6 +90,7 @@ class SteamDealService:
         history_country: str = "cn",
         max_deals: int = 10,
         max_players: int = 20,
+        search: SteamSearchClient | None = None,
     ) -> None:
         """Store the collaborators and defaults.
 
@@ -99,6 +102,8 @@ class SteamDealService:
             history_country: Heybox region code for price history.
             max_deals: Maximum number of games on the deals card.
             max_players: Maximum number of games on the player count card.
+            search: Fallback name resolver, defaulting to a storefront search
+                built from the shared HTTP client.
         """
         self.store = store
         self.heybox = heybox
@@ -107,6 +112,7 @@ class SteamDealService:
         self.history_country = history_country
         self.max_deals = max(max_deals, 1)
         self.max_players = max(max_players, 1)
+        self.search = search or SteamSearchClient(http)
 
     async def resolve_game(self, query: str) -> GameLookupResult:
         """Resolve a query into a single game or a candidate list.
@@ -129,8 +135,13 @@ class SteamDealService:
             card = await self.build_card(appid)
             return GameLookupResult(card=card, candidates=(), query=text)
 
-        candidates = await self.heybox.search(text)
+        candidates, degraded = await self._search_candidates(text)
         if not candidates:
+            if degraded:
+                raise LookupError(
+                    f"暂时无法解析「{text}」：中文名转换服务（小黑盒）当前不可用。\n"
+                    "可以先用英文名或 appid 查询，例如：steam游戏 105600"
+                )
             raise LookupError(f"没有找到与「{text}」匹配的 Steam 游戏，请检查名称。")
 
         # Heybox answers with localized titles, so an English query would not
@@ -141,6 +152,11 @@ class SteamDealService:
         # A best score of zero means no candidate name relates to the query at
         # all; offering those as choices would just be noise.
         if not ranked or ranked[0].score <= 0:
+            if degraded:
+                raise LookupError(
+                    f"暂时无法解析「{text}」：中文名转换服务（小黑盒）当前不可用。\n"
+                    "可以先用英文名或 appid 查询，例如：steam游戏 105600"
+                )
             raise LookupError(f"没有找到与「{text}」匹配的 Steam 游戏，请检查名称。")
         # Keep only candidates that actually relate to the query, so the choice
         # list does not fill up with unrelated games.
@@ -151,6 +167,32 @@ class SteamDealService:
             return GameLookupResult(card=card, candidates=(), query=text)
 
         return GameLookupResult(card=None, candidates=tuple(ranked), query=text)
+
+    async def _search_candidates(self, text: str) -> tuple[list[GameCandidate], bool]:
+        """Resolve a name to candidates, falling back when Heybox is down.
+
+        Chinese names can only be resolved through Heybox, so when that call
+        fails the plugin tries the Steam storefront search as a partial
+        replacement. Steam's search does not understand Chinese, but it does
+        keep English names and appids working instead of failing outright.
+
+        Args:
+            text: Raw user supplied game name.
+
+        Returns:
+            A tuple of the candidates and whether the result came from the
+            degraded fallback path.
+        """
+        try:
+            return await self.heybox.search(text), False
+        except SteamApiError as exc:
+            logger.warning(f"Heybox search failed, falling back to Steam search: {exc}")
+
+        try:
+            return await self.search.search(text), True
+        except SteamApiError as exc:
+            logger.warning(f"Steam search fallback also failed: {exc}")
+            return [], True
 
     async def _attach_steam_names(self, candidates: list[GameCandidate]) -> list[GameCandidate]:
         """Fill in each candidate's Steam storefront name.
