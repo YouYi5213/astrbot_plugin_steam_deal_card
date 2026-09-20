@@ -17,6 +17,7 @@ from .steam_api import (
     SteamStoreClient,
     build_deal_item,
     build_game_card,
+    capsule_urls,
 )
 
 _APPID_RE = re.compile(r"^\s*(?:appid[=: ]*)?(\d{3,10})\s*$", re.I)
@@ -249,7 +250,14 @@ class SteamDealService:
         if players is None and item is None:
             raise LookupError(f"Steam 没有 appid={appid} 的数据。")
         name = _item_name(item) or f"appid {appid}"
-        return PlayerCount(appid=appid, name=name, players=players, rank=1)
+        return PlayerCount(
+            appid=appid,
+            name=name,
+            players=players,
+            peak_today=await self._safe_peak(appid),
+            rank=1,
+            capsule_urls=capsule_urls(item) if item else (),
+        )
 
     async def top_players(self, limit: int | None = None) -> list[PlayerCount]:
         """Rank games by the number of players in them right now.
@@ -288,6 +296,7 @@ class SteamDealService:
                 name=_item_name(items.get(appid)) or f"appid {appid}",
                 players=players,
                 peak_today=peaks.get(appid),
+                capsule_urls=capsule_urls(items[appid]) if appid in items else (),
             )
             for appid, players in counts.items()
             if players is not None
@@ -297,6 +306,27 @@ class SteamDealService:
 
         ranked.sort(key=lambda entry: entry.players or 0, reverse=True)
         return [replace(entry, rank=index) for index, entry in enumerate(ranked[:wanted], start=1)]
+
+    async def _safe_peak(self, appid: int) -> int | None:
+        """Look up a game's charted peak without failing the lookup.
+
+        A single game is not necessarily on the chart, and the chart call is
+        only for extra context, so a failure must not break the lookup.
+
+        Args:
+            appid: Steam application id.
+
+        Returns:
+            The peak figure, or None when the chart omits the game.
+        """
+        try:
+            rows = await self.store.most_played(_CHART_POOL)
+        except Exception:  # noqa: BLE001 - context only, never fatal
+            return None
+        for row in rows:
+            if row["appid"] == appid:
+                return row["peak_in_game"] or None
+        return None
 
     async def _player_counts(self, appids: list[int]) -> dict[int, int | None]:
         """Fetch live player counts for several apps at once.
@@ -336,16 +366,32 @@ class SteamDealService:
         except SteamApiError:
             return {}
 
-    async def render_players(self, entries: list[PlayerCount]) -> bytes:
-        """Render the player count card.
+    async def render_players(
+        self,
+        entries: list[PlayerCount],
+        title: str | None = None,
+    ) -> bytes:
+        """Render the player count card, downloading cover images in parallel.
 
         Args:
             entries: Ranked player counts.
+            title: Heading override; defaults to a ranking or info heading
+                depending on how many entries were supplied.
 
         Returns:
             PNG image bytes.
         """
-        return await asyncio.to_thread(render_players_card, entries)
+        images = await asyncio.gather(
+            *[self._download_first(entry.capsule_urls) for entry in entries]
+        )
+        capsules = {
+            entry.appid: data
+            for entry, data in zip(entries, images, strict=True)
+            if data is not None
+        }
+        if title is None:
+            title = "Steam 实时在线" if len(entries) == 1 else "Steam 在线人数排行"
+        return await asyncio.to_thread(render_players_card, entries, capsules, title)
 
     async def render_game(self, card: GameCard) -> bytes:
         """Render a game card, downloading its capsule image.

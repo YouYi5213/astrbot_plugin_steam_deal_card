@@ -16,7 +16,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"

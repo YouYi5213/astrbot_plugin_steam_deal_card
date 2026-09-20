@@ -661,6 +661,7 @@ def _people(value: int) -> str:
 
 def render_players_card(
     entries: list[PlayerCount],
+    capsules: dict[int, bytes] | None = None,
     title: str = "Steam 在线人数排行",
     now: datetime | None = None,
 ) -> bytes:
@@ -668,16 +669,23 @@ def render_players_card(
 
     Args:
         entries: Games already sorted by live player count, most first.
+        capsules: Mapping of appid to raw capsule image bytes.
         title: Heading shown at the top of the card.
         now: Reference time; defaults to the current UTC time.
 
     Returns:
         PNG image bytes.
     """
+    capsules = capsules or {}
     stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    row_height = 88
-    header_height = 96
     count = len(entries)
+    # A single game is an info card, not a one-row ranking: the list layout
+    # would otherwise read as "rank 1 of 1".
+    single = count == 1
+
+    header_height = 96
+    row_height = 142 if single else 116
+    thumb_size = (196, 110) if single else (150, 84)
     height = header_height + count * row_height + PADDING
 
     image = Image.new("RGB", (CARD_WIDTH, height), BG)
@@ -685,9 +693,7 @@ def render_players_card(
 
     draw.text((PADDING, 30), title, font=_font(38), fill=TEXT)
     stamp_text = f"{stamp:%H:%M} UTC"
-    subtitle = (
-        f"实时在线 · {stamp_text}" if count == 1 else f"共 {count} 款 · 实时数据 {stamp_text}"
-    )
+    subtitle = f"实时在线 · {stamp_text}" if single else f"共 {count} 款 · 实时数据 {stamp_text}"
     draw.text(
         (CARD_WIDTH - PADDING, 44),
         subtitle,
@@ -696,13 +702,16 @@ def render_players_card(
         anchor="ra",
     )
 
-    rank_font = _font(28)
+    rank_font = _font(30)
     name_font = _font(26)
-    count_font = _font(30)
-    meta_font = _font(18)
-    # Reserve the widest realistic count so names wrap consistently.
-    count_width = _text_width(draw, "888.8 万", count_font) + 16
-    name_x = PADDING + 66
+    count_font = _font(32)
+    meta_font = _font(19)
+    # Reserve the widest realistic count so names get a stable budget.
+    count_width = _text_width(draw, "888.8 万", count_font) + 24
+    rank_x = PADDING + 14
+    # Without a rank column the thumbnail takes its place.
+    thumb_x = PADDING + 4 if single else PADDING + 52
+    name_x = thumb_x + thumb_size[0] + 18
 
     for index, entry in enumerate(entries, start=1):
         top = header_height + (index - 1) * row_height
@@ -712,18 +721,25 @@ def render_players_card(
             fill=PANEL if index % 2 == 1 else PANEL_ALT,
         )
 
-        # Top three get the accent colour so the ranking reads at a glance.
-        rank_colour = ACCENT if index <= 3 else TEXT_FAINT
-        draw.text(
-            (PADDING + 22, top + 26),
-            str(entry.rank or index),
-            font=rank_font,
-            fill=rank_colour,
-        )
+        thumb = _load_capsule(capsules.get(entry.appid), thumb_size, radius=8)
+        image.paste(thumb, (thumb_x, top + (row_height - 10 - thumb_size[1]) // 2), thumb)
 
-        name_width = CARD_WIDTH - PADDING - 10 - name_x - count_width - 20
+        # The rank is only meaningful in a list.
+        if not single:
+            # Top three get the accent colour so the ranking reads at a glance.
+            rank_colour = ACCENT if index <= 3 else TEXT_FAINT
+            draw.text(
+                (rank_x, top + 36),
+                str(entry.rank or index),
+                font=rank_font,
+                fill=rank_colour,
+            )
+
+        name_width = CARD_WIDTH - PADDING - 10 - name_x - count_width
+        name_y = top + 26 if single else top + 16
+        peak_y = top + 68 if single else top + 54
         draw.text(
-            (name_x, top + 16),
+            (name_x, name_y),
             _truncate(draw, entry.name, name_font, name_width),
             font=name_font,
             fill=TEXT,
@@ -734,7 +750,7 @@ def render_players_card(
         # anything that would imply a second live reading.
         if entry.peak_today:
             draw.text(
-                (name_x, top + 50),
+                (name_x, peak_y),
                 f"Steam 峰值 {_people(entry.peak_today)}",
                 font=meta_font,
                 fill=TEXT_FAINT,
@@ -742,7 +758,7 @@ def render_players_card(
 
         players_text = _people(entry.players) if entry.players else "未公开"
         draw.text(
-            (CARD_WIDTH - PADDING - 10, top + 26),
+            (CARD_WIDTH - PADDING - 10, top + (44 if single else 34)),
             players_text,
             font=count_font,
             fill=DISCOUNT if entry.players else TEXT_FAINT,

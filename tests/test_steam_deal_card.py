@@ -601,6 +601,21 @@ class PeopleFormatTests(unittest.TestCase):
         self.assertEqual(_people(120_000_000), "1.20 \u4ebf")
 
 
+def _png_bytes(size: tuple[int, int], colour: tuple[int, int, int] = (200, 60, 60)) -> bytes:
+    """Build a small solid PNG for capsule image tests.
+
+    Args:
+        size: ``(width, height)`` of the image.
+        colour: RGB fill colour.
+
+    Returns:
+        Encoded PNG bytes.
+    """
+    buffer = io.BytesIO()
+    Image.new("RGB", size, colour).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 class PlayerRenderTests(unittest.TestCase):
     def _entries(self) -> list[PlayerCount]:
         return [
@@ -639,6 +654,31 @@ class PlayerRenderTests(unittest.TestCase):
             return Image.open(io.BytesIO(png)).height
 
         self.assertGreater(height(tall), height(short))
+
+    def test_renders_with_cover_images(self) -> None:
+        card = render_players_card(
+            self._entries(), {730: _png_bytes((240, 135)), 570: _png_bytes((240, 135))}
+        )
+        self.assertTrue(card.startswith(b"\x89PNG"))
+
+    def test_a_broken_cover_falls_back_to_the_placeholder(self) -> None:
+        # Garbage bytes must not take down the card.
+        card = render_players_card(self._entries(), {730: b"not an image"})
+        self.assertTrue(card.startswith(b"\x89PNG"))
+
+    def test_covers_change_the_output(self) -> None:
+        # Proves the capsule bytes actually reach the canvas.
+        plain = render_players_card(self._entries())
+        with_cover = render_players_card(self._entries(), {730: _png_bytes((240, 135))})
+        self.assertNotEqual(plain, with_cover)
+
+    def test_empty_entries_still_render(self) -> None:
+        self.assertTrue(render_players_card([]).startswith(b"\x89PNG"))
+
+    def test_title_override_is_used(self) -> None:
+        with_title = render_players_card(self._entries(), title="CUSTOM")
+        default = render_players_card(self._entries())
+        self.assertNotEqual(with_title, default)
 
 
 class _StubStore:
@@ -711,6 +751,29 @@ class TopPlayersTests(unittest.TestCase):
         )
         self.assertEqual(entries[0].peak_today, 999)
         self.assertEqual(entries[0].players, 5)
+
+    def test_entries_carry_cover_urls(self) -> None:
+        # The cover is what makes the card readable, so it must survive the
+        # store-item lookup rather than being dropped.
+        chart = [{"appid": 1, "peak_in_game": 9}]
+        items = {
+            1: {
+                "name": "A",
+                "assets": {
+                    "asset_url_format": "steam/apps/1/${FILENAME}",
+                    "main_capsule": "capsule_616x353.jpg",
+                },
+            }
+        }
+        entries = asyncio.run(_service(_StubStore(chart, {1: 5}, items)).top_players(1))
+        self.assertTrue(entries[0].capsule_urls)
+        self.assertIn("capsule_616x353.jpg", entries[0].capsule_url)
+
+    def test_entries_without_store_items_have_no_covers(self) -> None:
+        chart = [{"appid": 1, "peak_in_game": 9}]
+        entries = asyncio.run(_service(_StubStore(chart, {1: 5}, {})).top_players(1))
+        self.assertEqual(entries[0].capsule_urls, ())
+        self.assertEqual(entries[0].capsule_url, "")
 
     def test_limit_truncates_after_sorting(self) -> None:
         chart = [{"appid": i, "peak_in_game": 100 - i} for i in range(1, 9)]
@@ -789,6 +852,19 @@ class PlayerCountTests(unittest.TestCase):
     def test_unknown_appid_raises_lookup_error(self) -> None:
         with self.assertRaises(LookupError):
             asyncio.run(_service(_StubStore([], {}, {})).player_count(999999))
+
+    def test_single_player_count_carries_cover_urls(self) -> None:
+        items = {
+            730: {
+                "name": "Counter-Strike 2",
+                "assets": {
+                    "asset_url_format": "steam/apps/730/${FILENAME}",
+                    "main_capsule": "capsule_616x353.jpg",
+                },
+            }
+        }
+        entry = asyncio.run(_service(_StubStore([], {730: 1}, items)).player_count(730))
+        self.assertTrue(entry.capsule_urls)
 
 
 if __name__ == "__main__":

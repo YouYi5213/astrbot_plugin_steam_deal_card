@@ -132,6 +132,7 @@ class PlayerCount:
             lower than ``players``, so it is shown as a separate labelled
             figure and never as the live count.
         rank: Position within the requested list, assigned after sorting.
+        capsule_urls: Candidate cover image URLs, best first.
     """
 
     appid: int
@@ -139,6 +140,12 @@ class PlayerCount:
     players: int | None = None
     peak_today: int | None = None
     rank: int = 0
+    capsule_urls: tuple[str, ...] = ()
+
+    @property
+    def capsule_url(self) -> str:
+        """Preferred capsule image URL, or an empty string when there is none."""
+        return self.capsule_urls[0] if self.capsule_urls else ""
 
     @property
     def store_url(self) -> str:
