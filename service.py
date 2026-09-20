@@ -227,7 +227,7 @@ class SteamDealService:
         Returns:
             PNG image bytes.
         """
-        capsule = await self._download(card.capsule_url)
+        capsule = await self._download_first(card.capsule_urls)
         return await asyncio.to_thread(render_game_card, card, capsule)
 
     async def render_deals(self, deals: list[DealItem]) -> bytes:
@@ -239,7 +239,7 @@ class SteamDealService:
         Returns:
             PNG image bytes.
         """
-        images = await asyncio.gather(*[self._download(deal.capsule_url) for deal in deals])
+        images = await asyncio.gather(*[self._download_first(deal.capsule_urls) for deal in deals])
         capsules = {
             deal.appid: data for deal, data in zip(deals, images, strict=True) if data is not None
         }
@@ -276,6 +276,24 @@ class SteamDealService:
             return await self.heybox.lowest_price(appid, self.history_country)
         except SteamApiError:
             return None
+
+    async def _download_first(self, urls: tuple[str, ...]) -> bytes | None:
+        """Download the first of several candidate images that resolves.
+
+        Steam capsule art is not always at the canonical path, so the candidates
+        are tried in order and the first success wins.
+
+        Args:
+            urls: Absolute image URLs in preference order.
+
+        Returns:
+            Image bytes, or None when every candidate failed.
+        """
+        for url in urls:
+            data = await self._download(url)
+            if data:
+                return data
+        return None
 
     async def _download(self, url: str) -> bytes | None:
         """Download an image, tolerating failure.

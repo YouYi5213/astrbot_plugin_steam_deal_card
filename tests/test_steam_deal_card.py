@@ -507,7 +507,7 @@ class RenderTests(unittest.TestCase):
                 discount_end=datetime(2026, 10, 1, tzinfo=timezone.utc),
             ),
             reviews=ReviewSummary(GOOD_REVIEWS_CN, 97, 1240388),
-            capsule_url="",
+            capsule_urls=(),
             lowest=LowestPrice(Decimal("18"), "CNY", "2021-05-14", 50),
             release_date="2011-05-16",
             developers=("Re-Logic",),
@@ -520,7 +520,7 @@ class RenderTests(unittest.TestCase):
 
     def test_renders_a_card_without_a_price_or_reviews(self) -> None:
         card = GameCard(
-            appid=1, name=FREE_GAME_CN, price=None, reviews=None, capsule_url="", is_free=True
+            appid=1, name=FREE_GAME_CN, price=None, reviews=None, capsule_urls=(), is_free=True
         )
         self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
 
@@ -530,7 +530,7 @@ class RenderTests(unittest.TestCase):
             name=LONG_NAME_CN * 6,
             price=None,
             reviews=None,
-            capsule_url="",
+            capsule_urls=(),
         )
         self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
 
@@ -540,7 +540,7 @@ class RenderTests(unittest.TestCase):
                 appid=index,
                 name=f"{GAME_CN} {index}",
                 price=PriceInfo(f"\u00a5{index}.00", "\u00a599.00", 50, discount_end=None),
-                capsule_url="",
+                capsule_urls=(),
                 lowest=LowestPrice(Decimal("5"), "CNY", "2024-01-01", 80),
                 reviews=ReviewSummary(VERY_GOOD_CN, 90, 1000),
             )
@@ -557,7 +557,7 @@ class RenderTests(unittest.TestCase):
                 appid=1,
                 name=GAME_CN,
                 price=PriceInfo("\u00a510.00", "\u00a520.00", 50),
-                capsule_url="",
+                capsule_urls=(),
             )
         ]
         self.assertTrue(render_deals_card(deals).startswith(b"\x89PNG"))

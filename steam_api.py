@@ -47,6 +47,9 @@ HEYBOX_WEB_BASE = "https://www.xiaoheihe.cn"
 _MAX_PAGE_SIZE = 100
 # Keep a single GetItems call within a size the endpoint answers quickly.
 _GET_ITEMS_CHUNK = 50
+# Budget for the first request to a not-yet-confirmed API host. The endpoint
+# normally answers in well under a second, so this only bounds a dead host.
+_HOST_PROBE_TIMEOUT = 8.0
 
 _ROW_RE = re.compile(r'<a[^>]*class="[^"]*search_result_row[^"]*"[\s\S]*?</a>')
 _APPID_RE = re.compile(r'data-ds-appid="([\d,]+)"')
@@ -142,8 +145,15 @@ class SteamStoreClient:
         bases = preferred + [base for base in STEAM_API_BASES if base not in preferred]
         failures: list[str] = []
         for base in bases:
+            # A blocked host can accept the TCP connection and then hang before
+            # sending anything, so the connect timeout alone does not bound the
+            # wait. Probing an unconfirmed host uses a tighter budget; once a
+            # host is known good the caller's normal timeout applies.
+            kwargs = {} if self._api_base else {"timeout": _HOST_PROBE_TIMEOUT}
             try:
-                response = await self.client.get(base + STEAM_GET_ITEMS_PATH, params=params)
+                response = await self.client.get(
+                    base + STEAM_GET_ITEMS_PATH, params=params, **kwargs
+                )
                 response.raise_for_status()
                 body = response.json()
             except Exception as exc:  # noqa: BLE001 - try the next host
@@ -417,32 +427,50 @@ def parse_reviews(item: dict[str, Any]) -> ReviewSummary | None:
     )
 
 
-def capsule_url(item: dict[str, Any]) -> str:
-    """Build the best available capsule image URL for a store item.
+def capsule_urls(item: dict[str, Any]) -> tuple[str, ...]:
+    """Build candidate capsule image URLs for a store item, best first.
 
     The global API reports a ``main_capsule`` filename while the China API only
-    reports the asset URL template, so the filename falls back to Steam's fixed
-    path for capsule art.
+    reports the asset URL template, so Steam's fixed capsule paths are appended
+    as fallbacks. Trying them in order covers games whose art does not sit at
+    the standard path and would otherwise render as a placeholder.
 
     Args:
         item: One ``store_items`` entry.
 
     Returns:
-        An absolute image URL, or an empty string when the item has no assets.
+        Absolute image URLs in preference order; empty when none can be built.
     """
     assets = item.get("assets") or {}
     template = str(assets.get("asset_url_format") or "")
-    filename = str(assets.get("main_capsule") or assets.get("header") or "")
-    if not filename:
+    if not template:
         appid = item.get("appid")
         if not isinstance(appid, int) or appid <= 0:
-            return ""
-        if not template:
-            template = f"steam/apps/{appid}/${{FILENAME}}"
-        filename = STEAM_CAPSULE_FALLBACKS[0]
-    if not template:
-        return ""
-    return STEAM_ASSET_BASE + template.replace("${FILENAME}", filename)
+            return ()
+        template = f"steam/apps/{appid}/${{FILENAME}}"
+
+    names: list[str] = []
+    for key in ("main_capsule", "header", "small_capsule"):
+        name = str(assets.get(key) or "").strip()
+        if name and name not in names:
+            names.append(name)
+    for name in STEAM_CAPSULE_FALLBACKS:
+        if name not in names:
+            names.append(name)
+    return tuple(STEAM_ASSET_BASE + template.replace("${FILENAME}", name) for name in names)
+
+
+def capsule_url(item: dict[str, Any]) -> str:
+    """Build the preferred capsule image URL for a store item.
+
+    Args:
+        item: One ``store_items`` entry.
+
+    Returns:
+        The best absolute image URL, or an empty string when none can be built.
+    """
+    urls = capsule_urls(item)
+    return urls[0] if urls else ""
 
 
 def _describe_error(exc: BaseException) -> str:
@@ -483,7 +511,7 @@ def build_game_card(
         name=str(item.get("name") or f"appid={appid}").strip(),
         price=parse_price(item),
         reviews=parse_reviews(item),
-        capsule_url=capsule_url(item),
+        capsule_urls=capsule_urls(item),
         lowest=lowest,
         release_date=_format_release_date(release.get("steam_release_date")),
         developers=_people_names(basic.get("developers")),
@@ -521,7 +549,7 @@ def build_deal_item(
         appid=row["appid"],
         name=(str(item.get("name")) if item and item.get("name") else row["name"]).strip(),
         price=price,
-        capsule_url=capsule_url(item) if item else row["capsule"],
+        capsule_urls=capsule_urls(item) if item else ((row["capsule"],) if row["capsule"] else ()),
         lowest=lowest,
         reviews=parse_reviews(item) if item else None,
     )

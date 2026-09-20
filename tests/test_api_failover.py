@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
 from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
+    _HOST_PROBE_TIMEOUT,
     STEAM_API_BASES,
     STEAM_CAPSULE_FALLBACKS,
     STEAM_GET_ITEMS_PATH,
@@ -25,6 +26,7 @@ from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
     SteamStoreClient,
     _describe_error,
     capsule_url,
+    capsule_urls,
 )
 
 
@@ -55,12 +57,13 @@ class _ScriptedClient:
         self.behaviour = behaviour
         self.calls: list[str] = []
 
-    async def get(self, url: str, params=None):
+    async def get(self, url: str, params=None, **kwargs):
         """Return or raise according to the scripted behaviour.
 
         Args:
             url: Full request URL.
             params: Ignored query parameters.
+            **kwargs: Ignored request options, such as a per-request timeout.
 
         Returns:
             The scripted response.
@@ -163,7 +166,7 @@ class FailoverTests(unittest.TestCase):
             }
         )
 
-        async def failing_get(url, params=None):
+        async def failing_get(url, params=None, **kwargs):
             host = url.split(STEAM_GET_ITEMS_PATH)[0]
             client.calls.append(host)
             if host == STEAM_API_BASES[0]:
@@ -228,6 +231,85 @@ class CapsuleUrlTests(unittest.TestCase):
             }
         )
         self.assertTrue(url.endswith("steam/apps/1/h.jpg"))
+
+
+class CapsuleUrlListTests(unittest.TestCase):
+    def test_reports_candidates_in_preference_order(self) -> None:
+        urls = capsule_urls(
+            {
+                "appid": 105600,
+                "assets": {
+                    "asset_url_format": "steam/apps/105600/${FILENAME}?t=1",
+                    "main_capsule": "reported.jpg",
+                },
+            }
+        )
+        # The reported filename wins, then the fixed fallbacks follow.
+        self.assertEqual(urls[0].split("/")[-1], "reported.jpg?t=1")
+        self.assertTrue(any(url.endswith("capsule_616x353.jpg?t=1") for url in urls))
+        self.assertTrue(any(url.endswith("header.jpg?t=1") for url in urls))
+
+    def test_always_offers_fallbacks_for_the_china_api_shape(self) -> None:
+        # This is the shape that produced a 404 in production.
+        urls = capsule_urls(
+            {"appid": 2909400, "assets": {"asset_url_format": "steam/apps/2909400/${FILENAME}?t=2"}}
+        )
+        self.assertGreaterEqual(len(urls), 2)
+        self.assertTrue(urls[0].endswith("capsule_616x353.jpg?t=2"))
+        self.assertTrue(urls[1].endswith("header.jpg?t=2"))
+
+    def test_candidates_are_deduplicated(self) -> None:
+        urls = capsule_urls(
+            {
+                "appid": 1,
+                "assets": {
+                    "asset_url_format": "steam/apps/1/${FILENAME}",
+                    "main_capsule": "capsule_616x353.jpg",
+                },
+            }
+        )
+        self.assertEqual(len(urls), len(set(urls)))
+
+    def test_returns_empty_tuple_without_an_appid_or_template(self) -> None:
+        self.assertEqual(capsule_urls({"assets": {}}), ())
+        self.assertEqual(capsule_urls({"appid": 0, "assets": {}}), ())
+
+    def test_all_candidates_share_the_same_template(self) -> None:
+        urls = capsule_urls(
+            {"appid": 7, "assets": {"asset_url_format": "steam/apps/7/${FILENAME}?t=9"}}
+        )
+        self.assertTrue(
+            all(url.startswith("https://shared.akamai.steamstatic.com/") for url in urls)
+        )
+        self.assertTrue(all(url.endswith("?t=9") for url in urls))
+
+
+class ProbeTimeoutTests(unittest.TestCase):
+    def test_unconfirmed_host_is_probed_with_a_short_timeout(self) -> None:
+        seen: list[object] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                seen.append(kwargs.get("timeout"))
+                return _FakeResponse(_body())
+
+        store = SteamStoreClient(_Client())
+        asyncio.run(store.get_items([105600]))
+        self.assertEqual(seen, [_HOST_PROBE_TIMEOUT])
+
+    def test_confirmed_host_uses_the_client_default_timeout(self) -> None:
+        seen: list[object] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                seen.append(kwargs.get("timeout"))
+                return _FakeResponse(_body())
+
+        store = SteamStoreClient(_Client())
+        asyncio.run(store.get_items([105600]))
+        asyncio.run(store.get_items([105600]))
+        # First call probes, second trusts the cached host and passes no override.
+        self.assertEqual(seen, [_HOST_PROBE_TIMEOUT, None])
 
 
 class DescribeErrorTests(unittest.TestCase):

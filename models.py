@@ -78,13 +78,18 @@ class GameCard:
     name: str
     price: PriceInfo | None
     reviews: ReviewSummary | None
-    capsule_url: str
+    capsule_urls: tuple[str, ...] = ()
     lowest: LowestPrice | None = None
     release_date: str = ""
     developers: tuple[str, ...] = ()
     genres: tuple[str, ...] = ()
     short_description: str = ""
     is_free: bool = False
+
+    @property
+    def capsule_url(self) -> str:
+        """Preferred capsule image URL, or an empty string when there is none."""
+        return self.capsule_urls[0] if self.capsule_urls else ""
 
     @property
     def store_url(self) -> str:
@@ -99,9 +104,14 @@ class DealItem:
     appid: int
     name: str
     price: PriceInfo
-    capsule_url: str
+    capsule_urls: tuple[str, ...] = ()
     lowest: LowestPrice | None = None
     reviews: ReviewSummary | None = None
+
+    @property
+    def capsule_url(self) -> str:
+        """Preferred capsule image URL, or an empty string when there is none."""
+        return self.capsule_urls[0] if self.capsule_urls else ""
 
     @property
     def store_url(self) -> str:
