@@ -563,7 +563,9 @@ def render_game_card(card: GameCard, capsule: bytes | None = None) -> bytes:
     price_block_y = PADDING + top_block_h + 24
     has_end = bool(card.price and card.price.discount_end)
     desc_h = len(desc_lines) * 30 + 18 if desc_lines else 0
-    height = price_block_y + 62 + 34 + (30 if has_end else 0) + desc_h + 52 + PADDING
+    # No footer row: the store links travel as text alongside the image, where
+    # they can actually be tapped.
+    height = price_block_y + 62 + 34 + (30 if has_end else 0) + desc_h + PADDING
 
     image = Image.new("RGB", (CARD_WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
@@ -653,19 +655,6 @@ def render_game_card(card: GameCard, capsule: bytes | None = None) -> bytes:
                 font=desc_font,
                 fill=TEXT_DIM,
             )
-
-    footer_y = height - PADDING - 18
-    # Kept on the card so a screenshot stays self-contained; the handler also
-    # sends it as text, because a URL inside an image cannot be tapped.
-    link_label = "商店链接："
-    link_font = _font(19)
-    draw.text((PADDING, footer_y), link_label, font=link_font, fill=TEXT_FAINT)
-    draw.text(
-        (PADDING + _text_width(draw, link_label, link_font), footer_y),
-        card.store_url,
-        font=link_font,
-        fill=ACCENT,
-    )
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")

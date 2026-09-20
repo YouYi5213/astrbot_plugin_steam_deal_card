@@ -726,14 +726,22 @@ class DescriptionAndLinkTests(unittest.TestCase):
         png = render_game_card(self._card("第一句。第二句。第三句。" * 8))
         self.assertTrue(png.startswith(b"\x89PNG"))
 
-    def test_store_url_is_always_present(self) -> None:
-        # The link is the call to action; it draws for every card shape.
+    def test_card_renders_for_every_price_shape(self) -> None:
         for card in (
             self._card("desc"),
             GameCard(1, "A", None, None),
             GameCard(2, "B", PriceInfo("¥1", "¥1", 0), None, is_free=True),
         ):
             self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
+
+    def test_store_url_is_not_drawn_on_the_card(self) -> None:
+        # The link is delivered as tappable text beside the image, so drawing
+        # it on the card too would only add a line nobody can click.
+        with_url = render_game_card(GameCard(105600, "Terraria", None, None))
+        # Two cards that differ only in appid must render identically, which
+        # cannot happen if the appid-derived URL is drawn.
+        other = render_game_card(GameCard(999999, "Terraria", None, None))
+        self.assertEqual(_pixels(with_url), _pixels(other))
 
 
 class WrapPunctuationTests(unittest.TestCase):
