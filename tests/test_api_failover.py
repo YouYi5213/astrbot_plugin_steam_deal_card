@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT.parent))
 
 from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
     _HOST_PROBE_TIMEOUT,
+    _SPECIALS_ATTEMPT_TIMEOUT,
+    _SPECIALS_ATTEMPTS,
     STEAM_API_BASES,
     STEAM_CAPSULE_FALLBACKS,
     STEAM_GET_ITEMS_PATH,
@@ -310,6 +312,81 @@ class ProbeTimeoutTests(unittest.TestCase):
         asyncio.run(store.get_items([105600]))
         # First call probes, second trusts the cached host and passes no override.
         self.assertEqual(seen, [_HOST_PROBE_TIMEOUT, None])
+
+
+class SpecialsRetryTests(unittest.TestCase):
+    """The specials host refuses connections intermittently, not permanently."""
+
+    PAGE = {
+        "results_html": (
+            '<a href="x" data-ds-appid="2369390" class="search_result_row">'
+            '<div class="search_capsule"><img src="https://i/x.jpg"></div>'
+            '<span class="title">Far Cry 6</span>'
+            '<div class="discount_block" data-discount="90">'
+            '<div class="discount_original_price">\u00a5298.00</div>'
+            '<div class="discount_final_price">\u00a529.80</div></div></a>'
+        )
+    }
+
+    def _client(self, failures_before_success: int):
+        """Build a client that refuses the first N attempts.
+
+        Args:
+            failures_before_success: How many attempts raise before one succeeds.
+
+        Returns:
+            A tuple of (client stub, call log).
+        """
+        calls: list[object] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                calls.append(kwargs.get("timeout"))
+                if len(calls) <= failures_before_success:
+                    # Real httpx timeouts carry an empty message.
+                    raise httpx.ConnectTimeout("")
+                return _FakeResponse(SpecialsRetryTests.PAGE)
+
+        return _Client(), calls
+
+    def test_recovers_after_transient_failures(self) -> None:
+        client, calls = self._client(failures_before_success=3)
+        rows = asyncio.run(SteamStoreClient(client).specials("CN", limit=1))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["appid"], 2369390)
+        self.assertEqual(len(calls), 4)
+
+    def test_eventual_failure_reports_the_attempt_count(self) -> None:
+        client, calls = self._client(failures_before_success=99)
+        with self.assertRaises(SteamApiError) as ctx:
+            asyncio.run(SteamStoreClient(client).specials("CN", limit=1))
+        self.assertIn(str(_SPECIALS_ATTEMPTS), str(ctx.exception))
+        self.assertIn("ConnectTimeout", str(ctx.exception))
+        self.assertEqual(len(calls), _SPECIALS_ATTEMPTS)
+
+    def test_every_attempt_uses_the_short_budget(self) -> None:
+        client, calls = self._client(failures_before_success=1)
+        asyncio.run(SteamStoreClient(client).specials("CN", limit=1))
+        self.assertTrue(all(t is _SPECIALS_ATTEMPT_TIMEOUT for t in calls))
+
+    def test_success_on_first_attempt_does_not_retry(self) -> None:
+        client, calls = self._client(failures_before_success=0)
+        asyncio.run(SteamStoreClient(client).specials("CN", limit=1))
+        self.assertEqual(len(calls), 1)
+
+    def test_empty_page_stops_pagination(self) -> None:
+        calls: list[int] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                calls.append(params["start"])
+                if params["start"] == 0:
+                    return _FakeResponse(SpecialsRetryTests.PAGE)
+                return _FakeResponse({"results_html": ""})
+
+        rows = asyncio.run(SteamStoreClient(_Client()).specials("CN", limit=5))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(calls, [0, 50])
 
 
 class DescribeErrorTests(unittest.TestCase):

@@ -50,6 +50,10 @@ _GET_ITEMS_CHUNK = 50
 # Budget for the first request to a not-yet-confirmed API host. The endpoint
 # normally answers in well under a second, so this only bounds a dead host.
 _HOST_PROBE_TIMEOUT = 8.0
+# The specials listing host refuses connections intermittently, so each attempt
+# gets a short budget and the request is retried a few times.
+_SPECIALS_ATTEMPTS = 5
+_SPECIALS_ATTEMPT_TIMEOUT = httpx.Timeout(6.0, connect=4.0)
 
 _ROW_RE = re.compile(r'<a[^>]*class="[^"]*search_result_row[^"]*"[\s\S]*?</a>')
 _APPID_RE = re.compile(r'data-ds-appid="([\d,]+)"')
@@ -178,7 +182,7 @@ class SteamStoreClient:
             Raw row dicts with appid, name, capsule and price text.
 
         Raises:
-            SteamApiError: If the listing endpoint fails.
+            SteamApiError: If the listing endpoint fails on every attempt.
         """
         rows: list[dict[str, Any]] = []
         seen: set[int] = set()
@@ -186,24 +190,7 @@ class SteamStoreClient:
         start = 0
         while len(rows) < wanted and start < 500:
             count = min(_MAX_PAGE_SIZE, max(wanted * 2, 50))
-            try:
-                response = await self.client.get(
-                    STEAM_SEARCH_RESULTS_URL,
-                    params={
-                        "query": "",
-                        "start": start,
-                        "count": count,
-                        "specials": 1,
-                        "infinite": 1,
-                        "cc": country,
-                        "l": self.language,
-                    },
-                )
-                response.raise_for_status()
-                body = response.json()
-            except Exception as exc:  # noqa: BLE001 - surfaced as a domain error
-                raise SteamApiError(f"Steam 特惠列表请求失败：{_describe_error(exc)}") from exc
-
+            body = await self._request_specials_page(country, start, count)
             page = _parse_specials_page(body.get("results_html") or "")
             if not page:
                 break
@@ -214,6 +201,54 @@ class SteamStoreClient:
                 rows.append(row)
             start += count
         return rows[:wanted]
+
+    async def _request_specials_page(
+        self,
+        country: str,
+        start: int,
+        count: int,
+    ) -> dict[str, Any]:
+        """Request one page of the specials list, retrying until it answers.
+
+        This host refuses connections intermittently rather than being blocked
+        outright, so a short per-attempt timeout plus a few retries turns a
+        frequent failure into a reliably fast success.
+
+        Args:
+            country: Steam storefront country code.
+            start: Pagination offset.
+            count: Rows to request.
+
+        Returns:
+            The decoded response body.
+
+        Raises:
+            SteamApiError: If every attempt failed.
+        """
+        params = {
+            "query": "",
+            "start": start,
+            "count": count,
+            "specials": 1,
+            "infinite": 1,
+            "cc": country,
+            "l": self.language,
+        }
+        last_error = "unknown"
+        for _ in range(_SPECIALS_ATTEMPTS):
+            try:
+                response = await self.client.get(
+                    STEAM_SEARCH_RESULTS_URL,
+                    params=params,
+                    timeout=_SPECIALS_ATTEMPT_TIMEOUT,
+                )
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:  # noqa: BLE001 - retried below
+                last_error = _describe_error(exc)
+        raise SteamApiError(
+            f"Steam 特惠列表请求失败：{last_error}（已重试 {_SPECIALS_ATTEMPTS} 次）"
+        )
 
 
 class HeyboxClient:
