@@ -28,6 +28,10 @@ DIVIDER = (52, 70, 92)
 CARD_WIDTH = 940
 PADDING = 28
 
+# Sentence marks that should never be left dangling at the end of a wrapped
+# line, which reads as a rendering bug rather than as truncation.
+_TRAILING_MARKS = "。，、；：！？,.;:!?）)】」』 \t"
+
 # Player counts are a "right now" figure, so the card stamps it in a local
 # clock rather than UTC. China has used a single fixed +08:00 offset since 1991
 # and observes no DST, so the fallback below is exact, not an approximation.
@@ -161,7 +165,16 @@ def _truncate(
             low = mid
         else:
             high = mid - 1
-    return text[:low] + ellipsis if low else ""
+    if not low:
+        return ""
+    cut = text[:low]
+    # Prefer cutting on a word boundary: "should at …" reads worse than
+    # "should …". CJK has no spaces, so this leaves those cuts untouched.
+    if not text[low].isspace() and " " in cut.rstrip():
+        head = cut.rstrip().rsplit(" ", 1)[0]
+        if head and _text_width(draw, head + ellipsis, font) <= max_width:
+            cut = head
+    return cut.rstrip(_TRAILING_MARKS) + ellipsis
 
 
 def _wrap(
@@ -190,22 +203,83 @@ def _wrap(
         return []
     lines: list[str] = []
     current = ""
-    for char in text:
-        candidate = current + char
+    # Track how much of the source has been consumed. Stripping tokens for
+    # display makes the rendered length differ from the source length, so the
+    # truncation tail cannot be derived from the lines themselves.
+    consumed = 0
+    truncated = False
+    # Latin text is split into words (with their trailing space) so a break
+    # lands between words; CJK has no spaces and is split per character.
+    for token in _wrap_tokens(text):
+        candidate = current + token
         if _text_width(draw, candidate, font) <= max_width or not current:
             current = candidate
+            consumed += len(token)
             continue
-        lines.append(current)
-        current = char
+        lines.append(current.strip())
+        stripped = token.lstrip()
+        consumed += len(token) - len(stripped)
+        current = stripped
+        consumed += len(stripped)
         if len(lines) == max_lines:
+            truncated = True
             break
-    if current and len(lines) < max_lines:
-        lines.append(current)
+    if current.strip() and len(lines) < max_lines:
+        lines.append(current.strip())
 
-    consumed = sum(len(line) for line in lines)
-    if consumed < len(text) and lines:
-        lines[-1] = _truncate(draw, lines[-1] + text[consumed:], font, max_width)
-    return lines[:max_lines]
+    if truncated and consumed < len(text):
+        remainder = text[consumed:]
+        # The cut can fall on a space, which would otherwise glue the next word
+        # onto the previous one.
+        joiner = "" if not remainder or remainder[0].isspace() else " "
+        lines[-1] = _truncate(draw, f"{lines[-1]}{joiner}{remainder}".strip(), font, max_width)
+    # Stop a line from ending on a dangling sentence mark, which happens when a
+    # wrap boundary lands right after punctuation.
+    if lines:
+        lines[-1] = lines[-1].rstrip(_TRAILING_MARKS)
+    return [line for line in lines[:max_lines] if line]
+
+
+def _wrap_tokens(text: str) -> list[str]:
+    """Split text into wrap units, keeping Latin words whole.
+
+    CJK is written without spaces, so those characters become one unit each.
+    Runs of Latin letters, digits and inner punctuation stay together with any
+    following space, which stops a line from breaking mid-word.
+
+    Args:
+        text: Text to split.
+
+    Returns:
+        The tokens, in order.
+    """
+    tokens: list[str] = []
+    word = ""
+    for char in text:
+        # A space ends a Latin word; anything else accumulates.
+        if char == " ":
+            if word:
+                tokens.append(word)
+                word = ""
+            tokens.append(" ")
+        elif char.isascii() and (char.isalnum() or char in "'-.:_+&/"):
+            word += char
+        else:
+            if word:
+                tokens.append(word)
+                word = ""
+            tokens.append(char)
+    if word:
+        tokens.append(word)
+    # Absorb each space into the preceding token so wrapping keeps the gap
+    # only between words, never at the start of a line.
+    merged: list[str] = []
+    for token in tokens:
+        if token == " " and merged:
+            merged[-1] += " "
+        else:
+            merged.append(token)
+    return merged
 
 
 def _rounded_image(image: Image.Image, size: tuple[int, int], radius: int) -> Image.Image:
@@ -351,6 +425,7 @@ def _draw_lowest(
     x: float,
     y: float,
     current: PriceInfo | None = None,
+    right_edge: float | None = None,
 ) -> None:
     """Draw the all time lowest price line.
 
@@ -360,6 +435,8 @@ def _draw_lowest(
         x: Left edge in pixels.
         y: Top edge in pixels.
         current: Current price, used to add a comparison note.
+        right_edge: When given, the distance from the current price to the
+            lowest price is drawn flush against this right edge.
     """
     font = _font(22)
     if lowest is None:
@@ -375,9 +452,32 @@ def _draw_lowest(
         details.append(lowest.recorded_on)
     if lowest.discount_percent:
         details.append(f"-{lowest.discount_percent}%")
-    if current is not None and current.current_value is not None:
+
+    # The gap is what the user actually wants to know: without it, "close to
+    # the low" and "twice the low" read the same. It gets its own space on the
+    # right rather than being appended into a line that may already be long.
+    gap_text = ""
+    if right_edge is not None and current is not None and current.current_value is not None:
         if current.current_value <= lowest.value:
-            details.append("当前已是史低")
+            gap_text = "当前已是史低"
+        else:
+            gap = current.current_value - lowest.value
+            gap_text = f"距史低还差 {_money(gap, current.currency or lowest.currency)}"
+
+    if gap_text:
+        gap_font = _font(22)
+        gap_w = _text_width(draw, gap_text, gap_font)
+        # Only draw the badge when it cannot collide with the left-hand text.
+        if cursor + 20 + gap_w <= right_edge:
+            draw.text(
+                (right_edge, y),
+                gap_text,
+                font=gap_font,
+                fill=DISCOUNT if gap_text == "当前已是史低" else WARN,
+                anchor="ra",
+            )
+        else:
+            details.append(gap_text)
     if details:
         draw.text((cursor + 10, y), "（" + "，".join(details) + "）", font=font, fill=TEXT_DIM)
 
@@ -451,9 +551,19 @@ def render_game_card(card: GameCard, capsule: bytes | None = None) -> bytes:
     meta_font = _font(20)
     top_block_h = max(image_size[1], len(title_lines) * 42 + 78)
 
+    # The description is already returned by the store query; showing it makes
+    # the card answer "what is this game" rather than only "what does it cost".
+    desc_font = _font(21)
+    desc_lines = (
+        _wrap(measure, card.short_description, desc_font, CARD_WIDTH - PADDING * 2, max_lines=3)
+        if card.short_description
+        else []
+    )
+
     price_block_y = PADDING + top_block_h + 24
     has_end = bool(card.price and card.price.discount_end)
-    height = price_block_y + 62 + 34 + (30 if has_end else 0) + 34 + PADDING
+    desc_h = len(desc_lines) * 30 + 18 if desc_lines else 0
+    height = price_block_y + 62 + 34 + (30 if has_end else 0) + desc_h + 52 + PADDING
 
     image = Image.new("RGB", (CARD_WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
@@ -514,7 +624,14 @@ def render_game_card(card: GameCard, capsule: bytes | None = None) -> bytes:
         draw.text((PADDING, price_block_y), "暂无价格", font=_font(34), fill=TEXT_FAINT)
 
     lowest_y = price_block_y + 62
-    _draw_lowest(draw, card.lowest, PADDING, lowest_y, card.price)
+    _draw_lowest(
+        draw,
+        card.lowest,
+        PADDING,
+        lowest_y,
+        card.price,
+        right_edge=CARD_WIDTH - PADDING,
+    )
 
     if has_end and card.price:
         draw.text(
@@ -524,12 +641,28 @@ def render_game_card(card: GameCard, capsule: bytes | None = None) -> bytes:
             fill=WARN,
         )
 
-    footer_y = height - PADDING - 16
+    # Description sits above the footer, separated by a divider so it reads as
+    # supporting detail rather than part of the price block.
+    if desc_lines:
+        desc_y = lowest_y + 34 + (30 if has_end else 0) + 20
+        draw.line((PADDING, desc_y - 12, CARD_WIDTH - PADDING, desc_y - 12), fill=DIVIDER, width=1)
+        for index, line in enumerate(desc_lines):
+            draw.text(
+                (PADDING, desc_y + index * 30),
+                line,
+                font=desc_font,
+                fill=TEXT_DIM,
+            )
+
+    footer_y = height - PADDING - 18
+    link_label = "商店链接："
+    link_font = _font(19)
+    draw.text((PADDING, footer_y), link_label, font=link_font, fill=TEXT_FAINT)
     draw.text(
-        (PADDING, footer_y),
+        (PADDING + _text_width(draw, link_label, link_font), footer_y),
         card.store_url,
-        font=_font(18),
-        fill=TEXT_FAINT,
+        font=link_font,
+        fill=ACCENT,
     )
 
     buffer = io.BytesIO()

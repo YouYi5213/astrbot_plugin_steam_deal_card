@@ -5,16 +5,47 @@ from __future__ import annotations
 import asyncio
 import io
 import sys
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
+
+
+def _install_astrbot_stub() -> None:
+    """Provide the minimal ``astrbot`` surface the plugin modules import.
+
+    ``service.py`` logs through AstrBot, so importing it outside a running
+    install fails. Installing the stub here keeps this file runnable on its own
+    instead of relying on another test module having imported first.
+    """
+    if "astrbot" in sys.modules:
+        return
+
+    class _Logger:
+        def info(self, *args, **kwargs):
+            pass
+
+        warning = info
+        error = info
+        exception = info
+
+    root = types.ModuleType("astrbot")
+    api = types.ModuleType("astrbot.api")
+    api.logger = _Logger()
+    api.AstrBotConfig = dict
+    root.api = api
+    sys.modules["astrbot"] = root
+    sys.modules["astrbot.api"] = api
+
+
+_install_astrbot_stub()
 
 import astrbot_plugin_steam_deal_card.render as render_mod  # noqa: E402
 from astrbot_plugin_steam_deal_card.models import (  # noqa: E402
@@ -36,6 +67,7 @@ from astrbot_plugin_steam_deal_card.name_match import (  # noqa: E402
 )
 from astrbot_plugin_steam_deal_card.render import (  # noqa: E402
     _display_timezone,
+    _font,
     _format_end,
     _money,
     _people,
@@ -604,6 +636,174 @@ class PeopleFormatTests(unittest.TestCase):
         self.assertEqual(_people(120_000_000), "1.20 \u4ebf")
 
 
+class LowestGapTests(unittest.TestCase):
+    """The gap to the historical low is the number users actually act on."""
+
+    def _card(self, current, low, currency="CNY"):
+        return GameCard(
+            appid=1,
+            name="G",
+            price=PriceInfo(
+                formatted_current=f"\u00a5{current}",
+                formatted_original=f"\u00a5{current}",
+                discount_percent=0,
+                currency=currency,
+                current_value=Decimal(str(current)),
+            ),
+            reviews=None,
+            lowest=LowestPrice(
+                value=Decimal(str(low)),
+                currency=currency,
+                recorded_on="2024-01-01",
+                discount_percent=50,
+            ),
+        )
+
+    def test_card_renders_with_a_gap_above_the_low(self) -> None:
+        png = render_game_card(self._card(58, "19.2"))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_card_renders_at_the_low(self) -> None:
+        png = render_game_card(self._card(18, "18"))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_card_renders_below_the_low(self) -> None:
+        # A new historical low on a deeper discount.
+        png = render_game_card(self._card(10, "18"))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_card_renders_without_a_current_price(self) -> None:
+        card = GameCard(appid=1, name="G", price=None, reviews=None)
+        self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
+
+    def test_card_renders_without_a_lowest(self) -> None:
+        card = GameCard(
+            appid=1,
+            name="G",
+            price=PriceInfo("¥10", "¥10", 0, current_value=Decimal("10")),
+            reviews=None,
+            lowest=None,
+        )
+        self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
+
+    def test_gap_does_not_collide_on_a_narrow_card(self) -> None:
+        # The gap badge must not be drawn over the left-hand text; with a huge
+        # number it falls back to the parenthesised note instead.
+        card = self._card("99999999", "0.01")
+        self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
+
+    def test_a_large_gap_changes_the_rendering(self) -> None:
+        near = _pixels(render_game_card(self._card(20, "19")))
+        far = _pixels(render_game_card(self._card(200, "19")))
+        self.assertNotEqual(near, far)
+
+
+class DescriptionAndLinkTests(unittest.TestCase):
+    """The description and store link are already fetched; both must show."""
+
+    def _card(self, description="", name="Game"):
+        return GameCard(
+            appid=367520,
+            name=name,
+            price=PriceInfo("¥58.00", "¥58.00", 0, current_value=Decimal("58")),
+            reviews=ReviewSummary("好评如潮", 96, 502960),
+            short_description=description,
+        )
+
+    def test_description_is_drawn(self) -> None:
+        without = _pixels(render_game_card(self._card("")))
+        with_desc = _pixels(render_game_card(self._card("这是一段游戏简介，用来测试渲染。")))
+        self.assertNotEqual(without, with_desc)
+
+    def test_a_long_description_is_capped_not_overflowing(self) -> None:
+        short = Image.open(io.BytesIO(render_game_card(self._card("短简介")))).height
+        long_card = render_game_card(self._card("很长的一段简介。" * 60))
+        self.assertTrue(long_card.startswith(b"\x89PNG"))
+        # Capped at three lines, so the card cannot grow without bound.
+        self.assertLess(Image.open(io.BytesIO(long_card)).height, short + 140)
+
+    def test_description_can_be_multiline(self) -> None:
+        png = render_game_card(self._card("第一句。第二句。第三句。" * 8))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_store_url_is_always_present(self) -> None:
+        # The link is the call to action; it draws for every card shape.
+        for card in (
+            self._card("desc"),
+            GameCard(1, "A", None, None),
+            GameCard(2, "B", PriceInfo("¥1", "¥1", 0), None, is_free=True),
+        ):
+            self.assertTrue(render_game_card(card).startswith(b"\x89PNG"))
+
+
+class WrapPunctuationTests(unittest.TestCase):
+    """A wrapped line must not end on a dangling sentence mark."""
+
+    def _draw(self):
+        return ImageDraw.Draw(Image.new("RGB", (10, 10)))
+
+    def test_no_line_ends_with_a_period(self) -> None:
+        text = "挖掘，战斗，探索，建造！在这个动感十足的冒险游戏里没有什么是不可能的。"
+        lines = _wrap(self._draw(), text, _font_for_test(21), 300, max_lines=4)
+        for line in lines:
+            self.assertFalse(line.endswith("。"), line)
+            self.assertFalse(line.endswith("，"), line)
+
+    def test_trailing_spaces_are_trimmed(self) -> None:
+        lines = _wrap(self._draw(), "aaa bbb ccc ddd eee fff", _font_for_test(20), 80, max_lines=8)
+        for line in lines:
+            self.assertEqual(line, line.rstrip())
+
+    def test_empty_lines_are_dropped(self) -> None:
+        lines = _wrap(self._draw(), "。", _font_for_test(20), 300, max_lines=3)
+        self.assertEqual(lines, [])
+
+    def test_wrapping_still_truncates_with_an_ellipsis(self) -> None:
+        lines = _wrap(self._draw(), "字" * 200, _font_for_test(21), 200, max_lines=2)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[-1].endswith("…"))
+
+    def test_latin_words_are_not_split_mid_word(self) -> None:
+        # Breaking "aaa bbb" into "aaa bb" / "b ccc" reads as a bug.
+        text = "aaa bbb ccc ddd eee fff"
+        lines = _wrap(self._draw(), text, _font_for_test(20), 120, max_lines=8)
+        for line in lines:
+            for word in line.split():
+                self.assertIn(word, text.split(), f"{word!r} is not a whole word")
+
+    def test_no_stray_leading_or_trailing_whitespace(self) -> None:
+        text = "aaa bbb ccc ddd eee fff"
+        for width in (80, 120, 200, 300):
+            for line in _wrap(self._draw(), text, _font_for_test(20), width, max_lines=8):
+                self.assertEqual(line, line.strip())
+
+    def test_truncation_prefers_a_word_boundary(self) -> None:
+        text = "It is a long English description that should wrap at boundaries."
+        lines = _wrap(self._draw(), text, _font_for_test(21), 300, max_lines=2)
+        # The cut must not leave a half word before the ellipsis.
+        self.assertTrue(lines[-1].endswith("…"))
+
+    def test_truncation_does_not_duplicate_text(self) -> None:
+        # The tail used to be appended twice, producing "dddfff".
+        text = "aaa bbb ccc ddd eee fff"
+        lines = _wrap(self._draw(), text, _font_for_test(20), 120, max_lines=2)
+        joined = "".join(lines).replace("…", "")
+        self.assertLessEqual(len(joined), len(text))
+
+    def test_cjk_truncation_has_no_dangling_punctuation(self) -> None:
+        text = "挖掘，战斗，探索，建造！在这个动感十足的冒险游戏里没有什么是不可能的。"
+        lines = _wrap(self._draw(), text, _font_for_test(21), 300, max_lines=2)
+        self.assertTrue(lines[-1].endswith("…"))
+        self.assertNotIn("，…", lines[-1])
+
+    def test_a_single_unbreakable_word_is_kept(self) -> None:
+        lines = _wrap(
+            self._draw(), "Supercalifragilisticexpialidocious", _font_for_test(21), 120, max_lines=2
+        )
+        self.assertTrue(lines)
+        self.assertEqual(lines[0], "Supercalifragilisticexpialidocious")
+
+
 class DisplayTimezoneTests(unittest.TestCase):
     """The card clock must be Beijing time, and must survive a missing tz db."""
 
@@ -674,6 +874,18 @@ class DisplayTimezoneTests(unittest.TestCase):
         one = render_players_card(entry, now=datetime(2026, 9, 20, 5, 0, tzinfo=timezone.utc))
         two = render_players_card(entry, now=datetime(2026, 9, 20, 6, 0, tzinfo=timezone.utc))
         self.assertNotEqual(_pixels(one), _pixels(two))
+
+
+def _font_for_test(size: int):
+    """Return the renderer's font for a size.
+
+    Args:
+        size: Font size in points.
+
+    Returns:
+        A Pillow font object.
+    """
+    return _font(size)
 
 
 def _pixels(png: bytes) -> bytes:
