@@ -18,7 +18,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.4.2"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -340,15 +340,15 @@ class SteamDealCardPlugin(Star):
         try:
             wanted = int(text) if text.isdigit() and int(text) > 0 else None
             items = await self.service.popular_new(wanted)
-            degraded = self.service.store.last_fallback_reason
+            fallback = self.service.store.last_fallback_reason
             image = await self.service.render_ranking(
                 items,
                 title="Steam 热门新品",
                 subtitle=f"共 {len(items)} 款 · 数据来自 Steam 商店",
                 note=(
-                    "店铺「热门新品」页面暂时无法访问，以下为搜索接口的近似结果"
-                    if degraded
-                    else "取自 Steam 商店「热门新品」，免费游戏显示为「免费游玩」"
+                    "Steam 国际站暂时无法访问，以下为国内站货架，条目较少"
+                    if fallback
+                    else "取自 Steam 商店首页「热门新品」，按发售日期排列"
                 ),
                 show_lowest=True,
             )
@@ -376,11 +376,17 @@ class SteamDealCardPlugin(Star):
         try:
             wanted = int(text) if text.isdigit() and int(text) > 0 else None
             items = await self.service.popular_upcoming(wanted)
+            fallback = self.service.store.last_fallback_reason
             image = await self.service.render_ranking(
                 items,
-                title="Steam 即将推出",
+                title="Steam 热门即将推出",
                 subtitle=f"共 {len(items)} 款 · 数据来自 Steam 商店",
-                note="Steam 官方「即将推出」货架；Steam 未提供未发售游戏的热度排序",
+                note=(
+                    "Steam 国际站暂时无法访问，以下为国内站货架，条目较少"
+                    if fallback
+                    else "取自 Steam 商店首页「热门即将推出」，含各游戏发售日期"
+                ),
+                show_release=True,
             )
         except LookupError as exc:
             yield event.plain_result(str(exc))

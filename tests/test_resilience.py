@@ -446,186 +446,156 @@ class HealthProbeTests(unittest.TestCase):
         self.assertEqual(result.detail, "ReadTimeout")
 
 
-class PopularListingTests(unittest.TestCase):
-    """Popular new releases and upcoming releases.
+class HomeShelfTests(unittest.TestCase):
+    """The home page's 热门新品 and 热门即将推出 shelves.
 
-    These are two different sources: a search filter that carries Steam's own
-    popularity ranking, and the storefront shelf for unreleased games, which
-    Steam publishes no popularity ordering for.
+    Both are inline in one document, so a single request serves both commands.
+    They are the lists the store itself shows, and no search parameter
+    combination reproduces them.
     """
 
-    def _client(self, payload, calls: list | None = None):
-        log = calls if calls is not None else []
-
-        class _C:
-            async def get(self, url, params=None, **kwargs):
-                log.append((str(url), dict(params or {})))
-                return _FakeResponse(payload)
-
-        return _C(), log
-
-    EXPLORE_HTML = (
-        '<a href="https://store.steampowered.com/app/5120650/_/" class="tab_item  " '
-        'data-ds-appid="5120650" data-ds-tagids="[597]">'
-        '<div class="tab_item_cap">'
-        '<img class="tab_item_cap_img" src="https://cdn/5120650/capsule.jpg" alt="\u82b1\u7816">'
+    # Markup mirrors the real page: tab_row_item rows, a lazy loaded capsule,
+    # and a separate container per tab.
+    PAGE = (
+        '<div id="tab_newreleases_content">'
+        '<a class="tab_row_item" data-ds-appid="3058360" href="x">'
+        '<img class="tab_row_capsule" src="https://cdn/trans.gif" '
+        'data-delayed-image="https://cdn/3058360/cap.jpg" alt="A">'
+        '<div class="tab_item_title">\u6cd5\u56fd\u5c0f\u9986\u513f</div>'
+        '<div class="tab_item_release_date">'
+        "\u53d1\u884c\u4e8e: 2026 \u5e74 9 \u6708 18 \u65e5</div>"
+        '<div class="discount_block" data-discount="52">'
+        '<div class="discount_original_price">\u00a580.10</div>'
+        '<div class="discount_final_price">\u00a538.34</div></div></a>'
+        '<a class="tab_row_item" data-ds-appid="730" href="x">'
+        '<div class="tab_item_title">Full Price Game</div>'
+        '<div class="discount_block" data-discount="0">'
+        '<div class="discount_final_price">\u00a533.00</div></div></a>'
         "</div>"
-        '<div class="discount_block tab_item_discount" data-discount="10">'
-        '<div class="discount_original_price">\u00a522.00</div>'
-        '<div class="discount_final_price">\u00a519.80</div></div>'
-        '<div class="tab_item_content"><div class="tab_item_name">\u82b1\u7816\u516c\u53f8</div>'
-        "</div></a>"
+        '<div id="tab_upcoming_content">'
+        '<a class="tab_row_item" data-ds-appid="4705510" href="x">'
+        '<img class="tab_row_capsule" data-delayed-image="https://cdn/4705510/c.jpg">'
+        '<div class="tab_item_title">Happy Wheels</div>'
+        '<div class="tab_item_release_date">'
+        "\u53d1\u884c\u65e5\u671f: 2026 \u5e74 9 \u6708 21 \u65e5</div>"
+        "</a></div>"
+        '<div id="tab_other_content"></div>'
     )
 
-    def test_popular_new_reads_the_explore_page(self) -> None:
-        # The explore page is the only source: no search parameter combination
-        # reproduces its ranking.
-        page = self.EXPLORE_HTML
+    def _client(self, page=None, boom=False):
+        pages = self.PAGE if page is None else page
 
-        class _Client:
+        class _C:
             def __init__(self):
                 self.urls = []
 
             async def get(self, url, params=None, **kwargs):
                 self.urls.append(str(url))
-                return _FakeResponse({}, text=page)
+                if boom:
+                    raise httpx.ConnectTimeout("")
+                return _FakeResponse({}, text=pages)
 
-        client = _Client()
+        return _C()
+
+    def test_new_reads_the_home_page(self) -> None:
+        client = self._client()
         rows = asyncio.run(SteamStoreClient(client).popular_new("CN", 10))
-        self.assertTrue(any("/explore/new/" in u for u in client.urls))
+        self.assertTrue(any(u.rstrip("/") == "https://store.steampowered.com" for u in client.urls))
+        self.assertEqual([r["appid"] for r in rows], [3058360, 730])
+
+    def test_new_parses_price_capsule_and_release(self) -> None:
+        rows = asyncio.run(SteamStoreClient(self._client()).popular_new("CN", 10))
+        first = rows[0]
+        self.assertEqual(first["name"], "\u6cd5\u56fd\u5c0f\u9986\u513f")
+        self.assertEqual(first["final"], "\u00a538.34")
+        self.assertEqual(first["discount"], 52)
+        # The capsule is lazy loaded, so src is a placeholder and the real URL
+        # lives in data-delayed-image.
+        self.assertEqual(first["capsule"], "https://cdn/3058360/cap.jpg")
+        self.assertIn("2026", first["release"])
+
+    def test_new_keeps_full_price_rows(self) -> None:
+        rows = asyncio.run(SteamStoreClient(self._client()).popular_new("CN", 10))
+        self.assertEqual(rows[1]["discount"], 0)
+        self.assertEqual(rows[1]["final"], "\u00a533.00")
+
+    def test_upcoming_reads_its_own_container(self) -> None:
+        # The two shelves share a page, so each must read only its own section.
+        rows = asyncio.run(SteamStoreClient(self._client()).popular_upcoming("CN", 10))
+        self.assertEqual([r["appid"] for r in rows], [4705510])
+        self.assertIn("21", rows[0]["release"])
+
+    def test_shelves_do_not_leak_into_each_other(self) -> None:
+        client = self._client()
+        new = asyncio.run(SteamStoreClient(client).popular_new("CN", 10))
+        up = asyncio.run(SteamStoreClient(client).popular_upcoming("CN", 10))
+        self.assertNotIn(4705510, [r["appid"] for r in new])
+        self.assertNotIn(3058360, [r["appid"] for r in up])
+
+    def test_the_limit_is_respected(self) -> None:
+        rows = asyncio.run(SteamStoreClient(self._client()).popular_new("CN", 1))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["appid"], 5120650)
-        self.assertEqual(rows[0]["name"], "\u82b1\u7816\u516c\u53f8")
-        self.assertEqual(rows[0]["final"], "\u00a519.80")
-        self.assertEqual(rows[0]["discount"], 10)
-        self.assertTrue(rows[0]["capsule"].startswith("https://"))
 
-    def test_popular_new_parses_rows_without_a_discount(self) -> None:
-        # Plenty of new games are at full price and must not be dropped.
-        html = (
-            '<a class="tab_item" data-ds-appid="730" href="x">'
-            '<div class="tab_item_cap"><img class="tab_item_cap_img" src="https://cdn/a.jpg"></div>'
-            '<div class="discount_block tab_item_discount" data-discount="0">'
-            '<div class="discount_final_price">\u00a533.00</div></div>'
-            '<div class="tab_item_name">Some Game</div></a>'
+    def test_duplicate_rows_keep_their_first_position(self) -> None:
+        page = (
+            '<div id="tab_newreleases_content">'
+            '<a class="tab_row_item" data-ds-appid="5" href="x">'
+            '<div class="tab_item_title">First</div></a>'
+            '<a class="tab_row_item" data-ds-appid="7" href="x">'
+            '<div class="tab_item_title">Second</div></a>'
+            '<a class="tab_row_item" data-ds-appid="5" href="x">'
+            '<div class="tab_item_title">First again</div></a>'
+            "</div>"
         )
+        rows = asyncio.run(SteamStoreClient(self._client(page)).popular_new("CN", 10))
+        self.assertEqual([r["appid"] for r in rows], [5, 7])
 
-        class _Client:
-            async def get(self, url, params=None, **kwargs):
-                return _FakeResponse({}, text=html)
-
-        rows = asyncio.run(SteamStoreClient(_Client()).popular_new("CN", 10))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["discount"], 0)
-
-    def test_popular_new_skips_bundles(self) -> None:
-        html = (
-            '<a class="tab_item" data-ds-appid="100,200" href="x">'
-            '<div class="tab_item_name">Bundle</div></a>'
-            '<a class="tab_item" data-ds-appid="300" href="x">'
-            '<div class="tab_item_name">Real Game</div></a>'
+    def test_bundles_are_skipped(self) -> None:
+        page = (
+            '<div id="tab_newreleases_content">'
+            '<a class="tab_row_item" data-ds-appid="100,200" href="x">'
+            '<div class="tab_item_title">Bundle</div></a>'
+            '<a class="tab_row_item" data-ds-appid="300" href="x">'
+            '<div class="tab_item_title">Real Game</div></a>'
+            "</div>"
         )
-
-        class _Client:
-            async def get(self, url, params=None, **kwargs):
-                return _FakeResponse({}, text=html)
-
-        rows = asyncio.run(SteamStoreClient(_Client()).popular_new("CN", 10))
+        rows = asyncio.run(SteamStoreClient(self._client(page)).popular_new("CN", 10))
         self.assertEqual([r["appid"] for r in rows], [300])
 
-    def test_popular_new_falls_back_to_search_when_page_is_unreachable(self) -> None:
-        # The explore page only exists on the global host, which is unreachable
-        # from some regions.
-        search_html = (
-            '<a class="search_result_row" data-ds-appid="1260320" href="x">'
-            '<span class="title">Party Animals</span>'
-            '<div class="discount_final_price">\u00a549.00</div></a>'
-        )
+    def test_a_missing_container_yields_nothing(self) -> None:
+        client = self._client("<html></html>")
+        self.assertEqual(asyncio.run(SteamStoreClient(client).popular_new("CN", 10)), [])
+
+    def test_the_home_page_fails_over_to_the_second_host(self) -> None:
+        # The global storefront drops out intermittently; the China one serves
+        # the same shelves from a smaller catalogue.
+        page = self.PAGE
         seen: list[str] = []
 
-        class _Client:
+        class _C:
             async def get(self, url, params=None, **kwargs):
                 seen.append(str(url))
-                if "/explore/new/" in str(url):
-                    raise httpx.ConnectTimeout("")
-                return _FakeResponse({"results_html": search_html})
-
-        store = SteamStoreClient(_Client())
-        rows = asyncio.run(store.popular_new("CN", 10))
-        self.assertEqual([r["appid"] for r in rows], [1260320])
-        self.assertIsNotNone(store.last_fallback_reason)
-
-    def test_a_healthy_page_leaves_no_fallback_reason(self) -> None:
-        page = self.EXPLORE_HTML
-
-        class _Client:
-            async def get(self, url, params=None, **kwargs):
+                if "store.steamchina.com" not in str(url):
+                    raise httpx.ReadTimeout("")
                 return _FakeResponse({}, text=page)
 
-        store = SteamStoreClient(_Client())
+        store = SteamStoreClient(_C())
+        rows = asyncio.run(store.popular_new("CN", 10))
+        self.assertEqual([r["appid"] for r in rows], [3058360, 730])
+        self.assertTrue(any("store.steamchina.com" in u for u in seen))
+        # The caller is expected to say the result came from the smaller site.
+        self.assertIsNotNone(store.last_fallback_reason)
+
+    def test_a_healthy_global_page_reports_no_fallback(self) -> None:
+        store = SteamStoreClient(self._client())
         asyncio.run(store.popular_new("CN", 10))
         self.assertIsNone(store.last_fallback_reason)
 
-    def test_popular_upcoming_reads_the_storefront_shelf(self) -> None:
-        payload = {
-            "coming_soon": {
-                "name": "\u5373\u5c06\u63a8\u51fa",
-                "items": [
-                    {"id": 5157680, "name": "DIY Dadish", "header_image": "https://x/a.jpg"},
-                    {"id": "bad", "name": "Bad"},
-                    {"id": 1, "name": "   "},
-                    "junk",
-                ],
-            }
-        }
-        client, _ = self._client(payload)
-        rows = asyncio.run(SteamStoreClient(client).popular_upcoming("CN"))
-        self.assertEqual([r["appid"] for r in rows], [5157680])
-        self.assertTrue(rows[0]["capsule"].startswith("https://"))
-
-    def test_popular_upcoming_handles_a_missing_section(self) -> None:
-        client, _ = self._client({})
-        self.assertEqual(asyncio.run(SteamStoreClient(client).popular_upcoming("CN")), [])
-
-    def test_popular_upcoming_falls_back_to_search(self) -> None:
-        # The shelf API only exists on the global host, which is unreachable
-        # from some regions, so the search filter must take over.
-        html = (
-            '<a class="search_result_row" data-ds-appid="5157680" href="x">'
-            '<span class="title">DIY Dadish</span>'
-            '<div class="discount_final_price"></div></a>'
-        )
-        seen: list[str] = []
-
-        class _Client:
-            async def get(self, url, params=None, **kwargs):
-                seen.append(str(url))
-                if "featuredcategories" in str(url):
-                    raise httpx.ConnectTimeout("")
-                return _FakeResponse({"results_html": html})
-
-        rows = asyncio.run(SteamStoreClient(_Client()).popular_upcoming("CN"))
-        self.assertEqual([r["appid"] for r in rows], [5157680])
-        self.assertTrue(any("featuredcategories" in u for u in seen))
-        self.assertTrue(any("/search/results/" in u for u in seen))
-
-    def test_a_failed_shelf_fallback_still_raises(self) -> None:
-        class _Boom:
-            async def get(self, *args, **kwargs):
-                raise httpx.ConnectTimeout("")
-
+    def test_failures_become_domain_errors(self) -> None:
         with self.assertRaises(SteamApiError):
-            asyncio.run(SteamStoreClient(_Boom()).popular_upcoming("CN"))
-
-    def test_listing_errors_become_domain_errors(self) -> None:
-        class _Boom:
-            async def get(self, *args, **kwargs):
-                raise httpx.ConnectTimeout("")
-
+            asyncio.run(SteamStoreClient(self._client(boom=True)).popular_new("CN", 5))
         with self.assertRaises(SteamApiError):
-            asyncio.run(SteamStoreClient(_Boom()).popular_new("CN", 5))
-        with self.assertRaises(SteamApiError):
-            asyncio.run(SteamStoreClient(_Boom()).popular_upcoming("CN"))
+            asyncio.run(SteamStoreClient(self._client(boom=True)).popular_upcoming("CN"))
 
 
 class FreeGameListingTests(unittest.TestCase):

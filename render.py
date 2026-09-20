@@ -699,6 +699,7 @@ def render_ranking_card(
     show_lowest: bool = False,
     show_discount: bool = False,
     show_end: bool = False,
+    show_release: bool = False,
     note: str = "",
 ) -> bytes:
     """Render a list of games as a single ranking image.
@@ -715,6 +716,7 @@ def render_ranking_card(
         show_lowest: Draw the all time lowest price line.
         show_discount: Draw the discount badge.
         show_end: Draw the discount end date.
+        show_release: Draw each game's own release date line.
         note: Optional explanatory line under the heading.
 
     Returns:
@@ -800,6 +802,25 @@ def render_ranking_card(
             )
             draw.text((bottom_x, top + 84), lowest_text, font=info_font, fill=TEXT_DIM)
             bottom_x += _text_width(draw, lowest_text, info_font) + 24
+
+        if show_release and deal.release:
+            release_text = deal.release
+            if release_text.startswith("发行"):
+                # The shelf already phrases it; keep that wording.
+                pass
+            elif release_text:
+                release_text = f"发行 {release_text}"
+            draw.text(
+                (bottom_x, top + 84),
+                _truncate(
+                    draw,
+                    release_text,
+                    info_font,
+                    CARD_WIDTH - PADDING - 10 - bottom_x,
+                ),
+                font=info_font,
+                fill=TEXT_DIM,
+            )
 
         if show_end:
             # Share the bottom row, giving it whatever width is left rather

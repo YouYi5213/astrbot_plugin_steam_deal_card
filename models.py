@@ -107,6 +107,7 @@ class DealItem:
     capsule_urls: tuple[str, ...] = ()
     lowest: LowestPrice | None = None
     reviews: ReviewSummary | None = None
+    release: str = ""
 
     @property
     def capsule_url(self) -> str:

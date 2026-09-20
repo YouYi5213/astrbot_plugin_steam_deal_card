@@ -300,10 +300,7 @@ class SteamDealService:
         return await self._enrich_rows(rows, "暂时没有获取到 Steam 热门新品。")
 
     async def popular_upcoming(self, limit: int | None = None) -> list[DealItem]:
-        """Fetch Steam's curated upcoming releases.
-
-        Steam publishes no popularity ranking for unreleased games, so this is
-        the storefront shelf, which is what the store itself shows.
+        """Fetch Steam's 热门即将推出 shelf.
 
         Args:
             limit: Override for the number of games to return.
@@ -315,10 +312,10 @@ class SteamDealService:
             LookupError: If the shelf cannot be fetched.
         """
         wanted = max(limit or self.max_deals, 1)
-        rows = await self.store.popular_upcoming(self.country)
+        rows = await self.store.popular_upcoming(self.country, limit=wanted)
         if not rows:
             raise LookupError("暂时没有获取到 Steam 即将推出的游戏。")
-        return await self._enrich_rows(rows[:wanted], "暂时没有获取到 Steam 即将推出的游戏。")
+        return await self._enrich_rows(rows, "暂时没有获取到 Steam 即将推出的游戏。")
 
     async def _enrich_rows(self, rows: list[dict], empty_message: str) -> list[DealItem]:
         """Attach store details and lowest prices to listing rows.
@@ -559,6 +556,7 @@ class SteamDealService:
         subtitle: str = "",
         note: str = "",
         show_lowest: bool = False,
+        show_release: bool = False,
     ) -> bytes:
         """Render a ranking list, downloading all capsule images in parallel.
 
@@ -568,6 +566,7 @@ class SteamDealService:
             subtitle: Small line beside the heading.
             note: Optional explanation under the heading.
             show_lowest: Draw the all time lowest price line.
+            show_release: Draw each game's release date line.
 
         Returns:
             PNG image bytes.
@@ -586,6 +585,7 @@ class SteamDealService:
             show_lowest,
             False,
             False,
+            show_release,
             note,
         )
 
