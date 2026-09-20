@@ -36,7 +36,18 @@ STEAM_API_BASES = (
     "https://api.steamchina.com",
 )
 STEAM_GET_ITEMS_URL = STEAM_API_BASES[0] + STEAM_GET_ITEMS_PATH
-STEAM_SEARCH_RESULTS_URL = "https://store.steampowered.com/search/results/"
+# The storefront search answers on both the global and the China host with the
+# same JSON envelope and the same markup. The global host is frequently
+# unreachable from mainland China servers, so both are tried in turn; see
+# _search_json. The China host carries a much smaller catalogue (13 rows for
+# popularnew against 369 globally), so it is a fallback, never the default.
+STEAM_SEARCH_BASES = (
+    "https://store.steampowered.com",
+    "https://store.steamchina.com",
+)
+STEAM_SEARCH_PATH = "/search/results/"
+STEAM_SEARCH_RESULTS_URL = STEAM_SEARCH_BASES[0] + STEAM_SEARCH_PATH
+STEAM_FEATURED_CATEGORIES_URL = "https://store.steampowered.com/api/featuredcategories/"
 # JSON storefront search, used only as a Heybox outage fallback. The older
 # /search/suggest endpoint returns HTML and no longer answers JSON, so this is
 # the reliable structured option. It does not understand Chinese names.
@@ -89,6 +100,9 @@ class SteamStoreClient:
         # Remembered after the first successful call so later requests do not
         # pay the connection timeout of the unreachable host on every lookup.
         self._api_base: str | None = None
+        # Set when a listing had to be served from a weaker source, so callers
+        # can surface that to the user.
+        self.last_fallback_reason: str | None = None
 
     async def get_items(
         self,
@@ -319,21 +333,191 @@ class SteamStoreClient:
             "cc": country,
             "l": self.language,
         }
-        last_error = "unknown"
-        for _ in range(_SPECIALS_ATTEMPTS):
-            try:
-                response = await self.client.get(
-                    STEAM_SEARCH_RESULTS_URL,
-                    params=params,
-                    timeout=_SPECIALS_ATTEMPT_TIMEOUT,
-                )
-                response.raise_for_status()
-                return response.json()
-            except Exception as exc:  # noqa: BLE001 - retried below
-                last_error = _describe_error(exc)
-        raise SteamApiError(
-            f"Steam 特惠列表请求失败：{last_error}（已重试 {_SPECIALS_ATTEMPTS} 次）"
+        return await self._search_json(params, "Steam 特惠列表")
+
+    async def popular_new(self, country: str = "CN", limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch Steam's popular new releases.
+
+        The ``popularnew`` filter is Steam's own popularity ordering for recent
+        releases. It is deliberately not the ``newreleases`` filter, which
+        returns long-established games (GTA V, Apex Legends) in release order.
+
+        Args:
+            country: Steam storefront country code.
+            limit: Maximum number of entries to return.
+
+        Returns:
+            Row dicts with appid, name, capsule and price text.
+
+        Raises:
+            SteamApiError: If the listing endpoint fails on every attempt.
+        """
+        body = await self._search_json(
+            {
+                "query": "",
+                "start": 0,
+                "count": min(max(limit, 1) * 2, _MAX_PAGE_SIZE),
+                "filter": "popularnew",
+                "infinite": 1,
+                "cc": country,
+                "l": self.language,
+            },
+            "Steam 热门新品",
         )
+        return _parse_specials_page(body.get("results_html") or "")[: max(limit, 1)]
+
+    async def popular_upcoming(self, country: str = "CN") -> list[dict[str, Any]]:
+        """Fetch Steam's curated upcoming releases.
+
+        Steam offers no popularity ordering for unreleased games: the
+        ``comingsoon`` search filter is ordered by release date and its first
+        hundred rows carry no reviews at all. The storefront shelf is therefore
+        used instead, which is curated by Steam and reliably contains notable
+        titles.
+
+        Args:
+            country: Steam storefront country code.
+
+        Returns:
+            Row dicts with appid, name and capsule URL.
+
+        Raises:
+            SteamApiError: If the shelf endpoint fails.
+        """
+        try:
+            response = await self.client.get(
+                STEAM_FEATURED_CATEGORIES_URL,
+                params={"cc": country, "l": self.language},
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001 - fallback below
+            # Only the global host serves the shelf API and it is unreachable
+            # from some regions, so fall back to the equivalent search filter.
+            # It is the weaker source (release order, many demos) but it beats
+            # returning nothing.
+            return await self._upcoming_from_search(country, _describe_error(exc))
+
+        section = body.get("coming_soon") if isinstance(body, dict) else None
+        items = section.get("items") if isinstance(section, dict) else None
+        rows: list[dict[str, Any]] = []
+        for entry in items if isinstance(items, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            appid = entry.get("id")
+            name = str(entry.get("name") or "").strip()
+            if not isinstance(appid, int) or isinstance(appid, bool) or not name:
+                continue
+            rows.append(
+                {
+                    "appid": appid,
+                    "name": name,
+                    "capsule": str(entry.get("header_image") or "").strip(),
+                    "original": "",
+                    "final": "",
+                    "discount": 0,
+                }
+            )
+        return rows
+
+    async def _upcoming_from_search(self, country: str, reason: str) -> list[dict[str, Any]]:
+        """Read upcoming games from the search endpoint when the shelf fails.
+
+        Args:
+            country: Steam storefront country code.
+            reason: Error text from the shelf request, kept for the log.
+
+        Returns:
+            Row dicts shaped like the shelf rows.
+
+        Raises:
+            SteamApiError: If the search endpoint also fails.
+        """
+        body = await self._search_json(
+            {
+                "query": "",
+                "start": 0,
+                "count": _MAX_PAGE_SIZE,
+                "filter": "comingsoon",
+                "category1": 998,  # excludes demos, which dominate the raw list
+                "infinite": 1,
+                "cc": country,
+                "l": self.language,
+            },
+            "Steam 即将推出列表",
+        )
+        # Recorded rather than logged, so this module stays free of the plugin
+        # framework and can be imported on its own.
+        self.last_fallback_reason = reason
+        return _parse_specials_page(body.get("results_html") or "")
+
+    async def _search_json(self, params: dict[str, Any], what: str) -> dict[str, Any]:
+        """Request a storefront search page, retrying hosts until one answers.
+
+        Each host refuses connections intermittently rather than being blocked
+        outright, so a short per-attempt timeout plus a few retries turns a
+        frequent failure into a reliably fast success. The hosts are tried in
+        turn because on a mainland China server the global host may be
+        unreachable for an extended period while the China host still answers.
+
+        Args:
+            params: Query parameters for the search endpoint.
+            what: Human readable name of the listing, used in errors.
+
+        Returns:
+            The decoded response body.
+
+        Raises:
+            SteamApiError: If every attempt on every host failed.
+        """
+        last_error = "unknown"
+        for base in STEAM_SEARCH_BASES:
+            url = base + STEAM_SEARCH_PATH
+            for _ in range(_SPECIALS_ATTEMPTS):
+                try:
+                    response = await self.client.get(
+                        url,
+                        params=params,
+                        timeout=_SPECIALS_ATTEMPT_TIMEOUT,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+                except Exception as exc:  # noqa: BLE001 - retried below
+                    last_error = _describe_error(exc)
+        raise SteamApiError(
+            f"{what}请求失败：{last_error}"
+            f"（已在 {len(STEAM_SEARCH_BASES)} 个站点各重试 {_SPECIALS_ATTEMPTS} 次）"
+        )
+
+    async def _request_specials_page(
+        self,
+        country: str,
+        start: int,
+        count: int,
+    ) -> dict[str, Any]:
+        """Request one page of the specials list.
+
+        Args:
+            country: Steam storefront country code.
+            start: Pagination offset.
+            count: Rows to request.
+
+        Returns:
+            The decoded response body.
+
+        Raises:
+            SteamApiError: If every attempt failed.
+        """
+        params = {
+            "query": "",
+            "start": start,
+            "count": count,
+            "specials": 1,
+            "infinite": 1,
+            "cc": country,
+            "l": self.language,
+        }
+        return await self._search_json(params, "Steam 特惠列表")
 
 
 class HeyboxClient:
@@ -514,7 +698,11 @@ async def download_image(client: httpx.AsyncClient, url: str) -> bytes | None:
 
 
 def _parse_specials_page(results_html: str) -> list[dict[str, Any]]:
-    """Extract discounted rows from the infinite-scroll search payload.
+    """Extract listing rows from the infinite-scroll search payload.
+
+    A discount is optional: the specials page only ever lists discounted
+    entries, but the same markup is reused for rankings such as popular new
+    releases, where most games are at full price.
 
     Args:
         results_html: The ``results_html`` field of the search response.
@@ -536,19 +724,15 @@ def _parse_specials_page(results_html: str) -> list[dict[str, Any]]:
         if not title_match:
             continue
         discount_match = _DISCOUNT_RE.search(row)
-        if not discount_match:
-            continue
         final_match = _FINAL_RE.search(row)
-        if not final_match:
-            continue
         original_match = _ORIGINAL_RE.search(row)
         capsule_match = _CAPSULE_RE.search(row)
         rows.append(
             {
                 "appid": int(raw_appid),
                 "name": html.unescape(title_match.group(1)).strip(),
-                "discount": int(discount_match.group(1)),
-                "final": html.unescape(final_match.group(1)).strip(),
+                "discount": int(discount_match.group(1)) if discount_match else 0,
+                "final": html.unescape(final_match.group(1)).strip() if final_match else "",
                 "original": html.unescape(original_match.group(1)).strip()
                 if original_match
                 else "",
@@ -701,6 +885,7 @@ def build_deal_item(
     row: dict[str, Any],
     item: dict[str, Any] | None,
     lowest: LowestPrice | None = None,
+    allow_free: bool = False,
 ) -> DealItem | None:
     """Assemble a :class:`DealItem`, preferring enriched store data.
 
@@ -708,6 +893,10 @@ def build_deal_item(
         row: A parsed specials list row.
         item: The matching store item, when the batch lookup succeeded.
         lowest: Optional all time lowest price.
+        allow_free: Keep entries with no price. Rankings need this, because
+            the most popular games are frequently free to play and dropping
+            them would misrepresent the list. The specials list leaves it off,
+            since a discount listing without a price is meaningless.
 
     Returns:
         The assembled deal item, or None when no price could be determined.
@@ -720,8 +909,15 @@ def build_deal_item(
             formatted_original=row["original"] or row["final"],
             discount_percent=row["discount"],
         )
-    if not price.formatted_current:
+    no_price = not price.formatted_current
+    if no_price and not allow_free:
         return None
+    if no_price:
+        price = PriceInfo(
+            formatted_current="免费游玩",
+            formatted_original="免费游玩",
+            discount_percent=0,
+        )
     return DealItem(
         appid=row["appid"],
         name=(str(item.get("name")) if item and item.get("name") else row["name"]).strip(),

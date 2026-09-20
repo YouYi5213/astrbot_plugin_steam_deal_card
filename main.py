@@ -18,7 +18,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.3.4"
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -40,6 +40,8 @@ _GAME_COMMANDS = ("steam游戏查询", "steam游戏", "steam查价", "steam价�
 _DEALS_COMMANDS = ("steam打折", "steam特惠", "steam促销", "steam优惠")
 _PLAYERS_COMMANDS = ("steam在线人数", "steam在线", "steam人数")
 _HOT_COMMANDS = ("steam热度榜", "steam热度", "steam排行", "steam在线榜")
+_NEW_COMMANDS = ("steam热门新品", "steam新品", "steam新游")
+_UPCOMING_COMMANDS = ("steam即将推出", "steam即将发售", "steam预售", "steam未发售")
 
 # Longest names first so "steam游戏查询" is not shadowed by "steam游戏".
 _GAME_CMD_RE = re.compile(
@@ -53,6 +55,12 @@ _PLAYERS_CMD_RE = re.compile(
 )
 _HOT_CMD_RE = re.compile(
     r"^/?(?:" + "|".join(re.escape(name) for name in _HOT_COMMANDS) + r")(?:\s|$)"
+)
+_NEW_CMD_RE = re.compile(
+    r"^/?(?:" + "|".join(re.escape(name) for name in _NEW_COMMANDS) + r")(?:\s|$)"
+)
+_UPCOMING_CMD_RE = re.compile(
+    r"^/?(?:" + "|".join(re.escape(name) for name in _UPCOMING_COMMANDS) + r")(?:\s|$)"
 )
 
 
@@ -314,6 +322,67 @@ class SteamDealCardPlugin(Star):
         except Exception as exc:  # noqa: BLE001 - reported to the user
             logger.exception("Steam player ranking failed")
             yield event.plain_result(f"获取在线人数排行失败：{exc}")
+            return
+
+        yield _image_result(event, image)
+
+    @filter.regex(_NEW_CMD_RE, priority=10)
+    async def steam_new_command(self, event: AstrMessageEvent):
+        """Handle the popular new releases command.
+
+        Args:
+            event: The incoming message event.
+
+        Yields:
+            Text or image results.
+        """
+        text = _strip_command(event.get_message_str(), _NEW_COMMANDS)
+        try:
+            wanted = int(text) if text.isdigit() and int(text) > 0 else None
+            items = await self.service.popular_new(wanted)
+            image = await self.service.render_ranking(
+                items,
+                title="Steam 热门新品",
+                subtitle=f"共 {len(items)} 款 · 数据来自 Steam 商店",
+                note="按 Steam 热门新品榜排序，免费游戏显示为「免费游玩」",
+                show_lowest=True,
+            )
+        except LookupError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - reported to the user
+            logger.exception("Steam popular new lookup failed")
+            yield event.plain_result(f"获取热门新品失败：{exc}")
+            return
+
+        yield _image_result(event, image)
+
+    @filter.regex(_UPCOMING_CMD_RE, priority=10)
+    async def steam_upcoming_command(self, event: AstrMessageEvent):
+        """Handle the popular upcoming command.
+
+        Args:
+            event: The incoming message event.
+
+        Yields:
+            Text or image results.
+        """
+        text = _strip_command(event.get_message_str(), _UPCOMING_COMMANDS)
+        try:
+            wanted = int(text) if text.isdigit() and int(text) > 0 else None
+            items = await self.service.popular_upcoming(wanted)
+            image = await self.service.render_ranking(
+                items,
+                title="Steam 即将推出",
+                subtitle=f"共 {len(items)} 款 · 数据来自 Steam 商店",
+                note="Steam 官方「即将推出」货架；Steam 未提供未发售游戏的热度排序",
+            )
+        except LookupError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - reported to the user
+            logger.exception("Steam upcoming lookup failed")
+            yield event.plain_result(f"获取即将推出的游戏失败：{exc}")
             return
 
         yield _image_result(event, image)

@@ -678,30 +678,74 @@ def render_deals_card(
     Returns:
         PNG image bytes.
     """
+    return render_ranking_card(
+        deals,
+        capsules=capsules,
+        title=title,
+        subtitle=f"共 {len(deals)} 款折扣游戏 · 数据来自 Steam 商店",
+        now=now,
+        show_lowest=True,
+        show_discount=True,
+        show_end=True,
+    )
+
+
+def render_ranking_card(
+    items: list[DealItem],
+    capsules: dict[int, bytes] | None = None,
+    title: str = "Steam",
+    subtitle: str = "",
+    now: datetime | None = None,
+    show_lowest: bool = False,
+    show_discount: bool = False,
+    show_end: bool = False,
+    note: str = "",
+) -> bytes:
+    """Render a list of games as a single ranking image.
+
+    Shared by the specials, popular-new and upcoming listings, which differ
+    only in which fields are meaningful for them.
+
+    Args:
+        items: Games to render, in the order they should appear.
+        capsules: Mapping of appid to raw capsule image bytes.
+        title: Heading shown at the top of the card.
+        subtitle: Small right-aligned line beside the heading.
+        now: Reference time for remaining-day calculations.
+        show_lowest: Draw the all time lowest price line.
+        show_discount: Draw the discount badge.
+        show_end: Draw the discount end date.
+        note: Optional explanatory line under the heading.
+
+    Returns:
+        PNG image bytes.
+    """
     capsules = capsules or {}
     row_height = 132
-    header_height = 96
-    count = len(deals)
+    header_height = 96 + (34 if note else 0)
+    count = len(items)
     height = header_height + count * row_height + PADDING
 
     image = Image.new("RGB", (CARD_WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
 
     draw.text((PADDING, 30), title, font=_font(38), fill=TEXT)
-    subtitle = f"共 {count} 款折扣游戏 · 数据来自 Steam 商店"
-    draw.text(
-        (CARD_WIDTH - PADDING, 44),
-        subtitle,
-        font=_font(20),
-        fill=TEXT_FAINT,
-        anchor="ra",
-    )
+    if subtitle:
+        draw.text(
+            (CARD_WIDTH - PADDING, 44),
+            subtitle,
+            font=_font(20),
+            fill=TEXT_FAINT,
+            anchor="ra",
+        )
+    if note:
+        draw.text((PADDING, 78), note, font=_font(19), fill=TEXT_FAINT)
 
     thumb_size = (196, 112)
     name_font = _font(26)
     info_font = _font(20)
 
-    for index, deal in enumerate(deals):
+    for index, deal in enumerate(items):
         top = header_height + index * row_height
         draw.rounded_rectangle(
             (PADDING - 10, top, CARD_WIDTH - PADDING + 10, top + row_height - 12),
@@ -720,7 +764,9 @@ def render_deals_card(
         price_text = deal.price.formatted_current
         price_w = _text_width(draw, price_text, price_font)
         badge_font = _font(20)
-        badge_text = f"-{deal.price.discount_percent}%" if deal.price.is_discounted else ""
+        badge_text = (
+            f"-{deal.price.discount_percent}%" if show_discount and deal.price.is_discounted else ""
+        )
         badge_w = _text_width(draw, badge_text, badge_font) + 18 if badge_text else 0.0
         reserved = max(price_w, badge_w) + 24
         name_width = CARD_WIDTH - PADDING - 10 - text_x - reserved
@@ -728,7 +774,7 @@ def render_deals_card(
         name = _truncate(draw, deal.name, name_font, name_width)
         draw.text((text_x, top + 18), name, font=name_font, fill=TEXT)
 
-        if deal.reviews:
+        if deal.reviews and deal.reviews.review_count:
             review_text = (
                 f"{deal.reviews.label} · {deal.reviews.percent_positive}% 好评 · "
                 f"{deal.reviews.review_count:,} 篇"
@@ -739,28 +785,36 @@ def render_deals_card(
                 font=info_font,
                 fill=DISCOUNT,
             )
+        elif deal.reviews:
+            # Steam reports an empty summary for something like an unreleased
+            # game; printing "0% 好评 · 0 篇" would read as a bad score.
+            draw.text((text_x, top + 54), "暂无用户评测", font=info_font, fill=TEXT_FAINT)
 
-        lowest_text = (
-            f"史低 {_money(deal.lowest.value, deal.lowest.currency)}"
-            if deal.lowest
-            else "史低 暂无"
-        )
-        draw.text((text_x, top + 84), lowest_text, font=info_font, fill=TEXT_DIM)
+        # The bottom row carries whichever context lines apply to this listing.
+        bottom_x = text_x
+        if show_lowest:
+            lowest_text = (
+                f"史低 {_money(deal.lowest.value, deal.lowest.currency)}"
+                if deal.lowest
+                else "史低 暂无"
+            )
+            draw.text((bottom_x, top + 84), lowest_text, font=info_font, fill=TEXT_DIM)
+            bottom_x += _text_width(draw, lowest_text, info_font) + 24
 
-        # The end date shares the bottom row with the lowest price, so give it
-        # whatever width is left rather than a fixed budget that truncates it.
-        end_text = _format_end(deal.price.discount_end, now, compact=True)
-        if end_text:
-            end_left = text_x + _text_width(draw, lowest_text, info_font) + 24
-            end_right = CARD_WIDTH - PADDING - 10
-            if end_right - end_left > 80:
-                draw.text(
-                    (end_right, top + 84),
-                    _truncate(draw, end_text, info_font, end_right - end_left),
-                    font=info_font,
-                    fill=WARN,
-                    anchor="ra",
-                )
+        if show_end:
+            # Share the bottom row, giving it whatever width is left rather
+            # than a fixed budget that truncates it.
+            end_text = _format_end(deal.price.discount_end, now, compact=True)
+            if end_text:
+                end_right = CARD_WIDTH - PADDING - 10
+                if end_right - bottom_x > 80:
+                    draw.text(
+                        (end_right, top + 84),
+                        _truncate(draw, end_text, info_font, end_right - bottom_x),
+                        font=info_font,
+                        fill=WARN,
+                        anchor="ra",
+                    )
 
         # Price block is right aligned so long names never collide with it.
         draw.text(

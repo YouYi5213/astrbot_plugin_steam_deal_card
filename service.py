@@ -11,7 +11,13 @@ from astrbot.api import logger
 
 from .models import DealItem, GameCandidate, GameCard, PlayerCount
 from .name_match import is_confident, rank_candidates
-from .render import render_candidates, render_deals_card, render_game_card, render_players_card
+from .render import (
+    render_candidates,
+    render_deals_card,
+    render_game_card,
+    render_players_card,
+    render_ranking_card,
+)
 from .steam_api import (
     HeyboxClient,
     SteamApiError,
@@ -34,6 +40,10 @@ _CHART_POOL = 100
 # Player counts are one request per app, so cap how many run at once to stay a
 # good citizen without making the user wait for a serial loop.
 _PLAYER_CONCURRENCY = 12
+
+# Placeholder price shown for games that cost nothing. Shared with the builder
+# so the "is this free" test stays in one place.
+_FREE_LABEL = "免费游玩"
 
 
 class LookupError(RuntimeError):
@@ -271,6 +281,85 @@ class SteamDealService:
             raise LookupError("暂时没有获取到 Steam 折扣游戏。")
         return deals
 
+    async def popular_new(self, limit: int | None = None) -> list[DealItem]:
+        """Fetch Steam's popular new releases.
+
+        Args:
+            limit: Override for the number of games to return.
+
+        Returns:
+            The games, in Steam's own popularity order.
+
+        Raises:
+            LookupError: If the listing cannot be fetched.
+        """
+        wanted = max(limit or self.max_deals, 1)
+        rows = await self.store.popular_new(self.country, limit=wanted)
+        if not rows:
+            raise LookupError("暂时没有获取到 Steam 热门新品。")
+        return await self._enrich_rows(rows, "暂时没有获取到 Steam 热门新品。")
+
+    async def popular_upcoming(self, limit: int | None = None) -> list[DealItem]:
+        """Fetch Steam's curated upcoming releases.
+
+        Steam publishes no popularity ranking for unreleased games, so this is
+        the storefront shelf, which is what the store itself shows.
+
+        Args:
+            limit: Override for the number of games to return.
+
+        Returns:
+            The games, in the shelf's own order.
+
+        Raises:
+            LookupError: If the shelf cannot be fetched.
+        """
+        wanted = max(limit or self.max_deals, 1)
+        rows = await self.store.popular_upcoming(self.country)
+        if not rows:
+            raise LookupError("暂时没有获取到 Steam 即将推出的游戏。")
+        return await self._enrich_rows(rows[:wanted], "暂时没有获取到 Steam 即将推出的游戏。")
+
+    async def _enrich_rows(self, rows: list[dict], empty_message: str) -> list[DealItem]:
+        """Attach store details and lowest prices to listing rows.
+
+        Args:
+            rows: Raw listing rows.
+            empty_message: Error text when every row fails to build.
+
+        Returns:
+            The built items, rows that cannot be built being skipped.
+
+        Raises:
+            LookupError: If no row could be built.
+        """
+        appids = [row["appid"] for row in rows]
+        items, *lowests = await asyncio.gather(
+            self.store.get_items(appids, self.country),
+            *[self._safe_lowest(appid) for appid in appids],
+        )
+        lowest_by_appid = dict(zip(appids, lowests, strict=True))
+
+        built: list[DealItem] = []
+        for row in rows:
+            appid = row["appid"]
+            item = build_deal_item(
+                row,
+                items.get(appid),
+                lowest_by_appid.get(appid),
+                allow_free=True,
+            )
+            if item is None:
+                continue
+            # A free game has no meaningful historical low, and Heybox would
+            # otherwise report a figure for a paid edition of the same title.
+            if item.price.formatted_current == _FREE_LABEL:
+                item = replace(item, lowest=None, price=replace(item.price, discount_end=None))
+            built.append(item)
+        if not built:
+            raise LookupError(empty_message)
+        return built
+
     async def player_count(self, appid: int) -> PlayerCount:
         """Fetch the live player count for one game.
 
@@ -461,6 +550,44 @@ class SteamDealService:
             deal.appid: data for deal, data in zip(deals, images, strict=True) if data is not None
         }
         return await asyncio.to_thread(render_deals_card, deals, capsules)
+
+    async def render_ranking(
+        self,
+        items: list[DealItem],
+        *,
+        title: str,
+        subtitle: str = "",
+        note: str = "",
+        show_lowest: bool = False,
+    ) -> bytes:
+        """Render a ranking list, downloading all capsule images in parallel.
+
+        Args:
+            items: Games to render, in display order.
+            title: Heading for the card.
+            subtitle: Small line beside the heading.
+            note: Optional explanation under the heading.
+            show_lowest: Draw the all time lowest price line.
+
+        Returns:
+            PNG image bytes.
+        """
+        images = await asyncio.gather(*[self._download_first(item.capsule_urls) for item in items])
+        capsules = {
+            item.appid: data for item, data in zip(items, images, strict=True) if data is not None
+        }
+        return await asyncio.to_thread(
+            render_ranking_card,
+            items,
+            capsules,
+            title,
+            subtitle,
+            None,
+            show_lowest,
+            False,
+            False,
+            note,
+        )
 
     async def render_candidate_list(
         self,

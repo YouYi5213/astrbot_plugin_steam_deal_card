@@ -16,6 +16,9 @@
 - **打折列表**：列出当前促销游戏，含商品展示图、游戏名、当前价、折扣、史低和折扣结束日期。
 - **在线人数**：查询单个游戏的**实时**在线人数，或按实时人数从高到低查看热度排行，
   卡片带游戏封面缩略图。
+- **热门新品**：Steam 热门新品榜，含封面、价格、评价与史低。
+- **即将推出**：Steam 官方「即将推出」货架。注意这不是热度榜，Steam 未提供
+  未发售游戏的热度排序，详见「已知限制」。
 - **评价信息**：好评率、评测数量和「好评如潮」等 Steam 评价标签。
 - **无需 Key**：只使用 Steam 商店与公开接口，不接入 ITAD，不需要 Steam Web API Key。
 
@@ -43,6 +46,8 @@ steam游戏 <序号>          # 从上一条候选列表中选一个
 steam打折 [数量]
 steam在线 <游戏名|appid>
 steam热度 [数量]
+steam热门新品 [数量]
+steam即将推出 [数量]
 ```
 
 示例：
@@ -59,6 +64,8 @@ steam在线 泰拉瑞亚           # 单个游戏的实时在线人数
 steam在线 730              # 也可以按 appid
 steam热度                  # 在线人数榜，默认 20 款
 steam热度 10               # 只看前 10
+steam热门新品              # Steam 热门新品榜
+steam即将推出              # Steam 官方「即将推出」货架
 ```
 
 别名：
@@ -67,6 +74,8 @@ steam热度 10               # 只看前 10
 - `steam打折`：`steam特惠`、`steam促销`、`steam优惠`
 - `steam在线`：`steam在线人数`、`steam人数`
 - `steam热度`：`steam热度榜`、`steam排行`、`steam在线榜`
+- `steam热门新品`：`steam新品`、`steam新游`
+- `steam即将推出`：`steam即将发售`、`steam预售`、`steam未发售`
 
 ### 多候选选择
 
@@ -92,7 +101,7 @@ steam游戏 1
 | `country` | `CN` | Steam 商店区域代码，影响价格与货币 |
 | `language` | `schinese` | Steam 商店语言，影响游戏名与描述语言 |
 | `history_country` | `cn` | 小黑盒历史价格区域，用于查询史低 |
-| `max_deals` | `10` | `steam打折` 默认显示数量 |
+| `max_deals` | `10` | `steam打折`、`steam热门新品`、`steam即将推出` 默认显示数量 |
 | `max_players` | `20` | `steam热度` 在线人数榜默认显示数量 |
 
 ## 数据来源
@@ -104,6 +113,8 @@ steam游戏 1
 | 历史最低价 | 小黑盒公开历史价格接口 |
 | 实时在线人数 | Steam `ISteamUserStats/GetNumberOfCurrentPlayers` |
 | 热度榜候选与峰值 | Steam `ISteamChartsService/GetMostPlayedGames` |
+| 热门新品榜 | Steam 商店搜索 `filter=popularnew` |
+| 即将推出货架 | Steam 商店 `featuredcategories` 的 `coming_soon` |
 
 折扣结束时间来自 Steam 返回的 `discount_end_date`，是商店公布的正式结束时间。
 
@@ -141,6 +152,11 @@ steam游戏 1
   而不是全站所有游戏里在线人数的绝对前 N。
 - 史低来自小黑盒记录，可能与其它史低数据源存在差异。
 - 免费游戏与尚未发售的游戏没有价格，卡片会显示对应状态。
+- `steam热门新品` 用的是 Steam 商店的 `popularnew` 排序。它不等于「最近发售
+  的游戏」：免费运营的长线游戏（CS2、PUBG、Apex）也会长期在榜。
+- `steam即将推出` **不是热度榜**。Steam 没有为未发售游戏提供热度排序——
+  `comingsoon` 搜索按发售日期排，实测前 100 条无一条有评测。这里取的是商店
+  首页的官方货架，只有 10 款且明显偏向小制作与 Demo，属于数据源本身的限制。
 - 图片渲染需要 Pillow；渲染失败时会自动回退为文字结果。
 
 ## 开发

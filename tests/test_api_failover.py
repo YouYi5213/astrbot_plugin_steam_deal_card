@@ -26,6 +26,7 @@ from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
     STEAM_GET_ITEMS_PATH,
     STEAM_MOST_PLAYED_PATH,
     STEAM_PLAYER_COUNT_PATH,
+    STEAM_SEARCH_BASES,
     SteamApiError,
     SteamStoreClient,
     _describe_error,
@@ -364,7 +365,41 @@ class SpecialsRetryTests(unittest.TestCase):
             asyncio.run(SteamStoreClient(client).specials("CN", limit=1))
         self.assertIn(str(_SPECIALS_ATTEMPTS), str(ctx.exception))
         self.assertIn("ConnectTimeout", str(ctx.exception))
-        self.assertEqual(len(calls), _SPECIALS_ATTEMPTS)
+        # Both storefront hosts are tried before giving up.
+        self.assertEqual(len(calls), _SPECIALS_ATTEMPTS * len(STEAM_SEARCH_BASES))
+
+    def test_the_search_endpoint_fails_over_to_the_second_host(self) -> None:
+        # The global storefront is unreachable from some regions for extended
+        # periods, while the China host still answers with the same envelope.
+        hosts: list[str] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                hosts.append(str(url))
+                if "store.steampowered.com" in str(url):
+                    raise httpx.ConnectTimeout("")
+                return _FakeResponse(SpecialsRetryTests.PAGE)
+
+        rows = asyncio.run(SteamStoreClient(_Client()).specials("CN", limit=1))
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(hosts[0].startswith("https://store.steampowered.com"))
+        self.assertTrue(
+            any(h.startswith("https://store.steamchina.com") for h in hosts),
+            "should have retried on the China storefront host",
+        )
+
+    def test_the_global_host_is_preferred_when_it_answers(self) -> None:
+        # The China host carries a far smaller catalogue, so it must never be
+        # used while the global host is healthy.
+        hosts: list[str] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                hosts.append(str(url))
+                return _FakeResponse(SpecialsRetryTests.PAGE)
+
+        asyncio.run(SteamStoreClient(_Client()).specials("CN", limit=1))
+        self.assertTrue(all("store.steamchina.com" not in h for h in hosts))
 
     def test_every_attempt_uses_the_short_budget(self) -> None:
         client, calls = self._client(failures_before_success=1)

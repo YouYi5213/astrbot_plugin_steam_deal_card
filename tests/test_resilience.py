@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,7 +27,7 @@ from astrbot_plugin_steam_deal_card.health import (  # noqa: E402
     probe_steam_store,
     run_health_check,
 )
-from astrbot_plugin_steam_deal_card.models import GameCandidate  # noqa: E402
+from astrbot_plugin_steam_deal_card.models import GameCandidate, LowestPrice  # noqa: E402
 from astrbot_plugin_steam_deal_card.service import (  # noqa: E402
     LookupError,
     SteamDealService,
@@ -35,6 +36,8 @@ from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
     STEAM_SEARCH_SUGGEST_URL,
     SteamApiError,
     SteamSearchClient,
+    SteamStoreClient,
+    build_deal_item,
 )
 
 # CJK written as escapes so the file survives a tool that rewrites encoding.
@@ -440,6 +443,185 @@ class HealthProbeTests(unittest.TestCase):
             store.current_players = original  # type: ignore[assignment]
         self.assertFalse(result.ok)
         self.assertEqual(result.detail, "ReadTimeout")
+
+
+class PopularListingTests(unittest.TestCase):
+    """Popular new releases and upcoming releases.
+
+    These are two different sources: a search filter that carries Steam's own
+    popularity ranking, and the storefront shelf for unreleased games, which
+    Steam publishes no popularity ordering for.
+    """
+
+    def _client(self, payload, calls: list | None = None):
+        log = calls if calls is not None else []
+
+        class _C:
+            async def get(self, url, params=None, **kwargs):
+                log.append((str(url), dict(params or {})))
+                return _FakeResponse(payload)
+
+        return _C(), log
+
+    def test_popular_new_requests_the_popularnew_filter(self) -> None:
+        client, calls = self._client({"results_html": ""})
+        asyncio.run(SteamStoreClient(client).popular_new("CN", 5))
+        params = calls[0][1]
+        self.assertEqual(params["filter"], "popularnew")
+        # The plain newreleases filter returns long-established games such as
+        # GTA V, so it must not be used for a "new" ranking.
+        self.assertNotEqual(params.get("filter"), "newreleases")
+
+    def test_popular_new_parses_rows_without_a_discount(self) -> None:
+        # Most popular games are at full price; requiring a discount would
+        # silently drop them from the list.
+        html = (
+            '<a class="search_result_row" data-ds-appid="730" href="x">'
+            '<span class="title">Counter-Strike 2</span>'
+            '<div class="discount_final_price">\u514d\u8d39\u6e38\u73a9</div></a>'
+        )
+        client, _ = self._client({"results_html": html})
+        rows = asyncio.run(SteamStoreClient(client).popular_new("CN", 5))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["appid"], 730)
+        self.assertEqual(rows[0]["discount"], 0)
+
+    def test_popular_upcoming_reads_the_storefront_shelf(self) -> None:
+        payload = {
+            "coming_soon": {
+                "name": "\u5373\u5c06\u63a8\u51fa",
+                "items": [
+                    {"id": 5157680, "name": "DIY Dadish", "header_image": "https://x/a.jpg"},
+                    {"id": "bad", "name": "Bad"},
+                    {"id": 1, "name": "   "},
+                    "junk",
+                ],
+            }
+        }
+        client, _ = self._client(payload)
+        rows = asyncio.run(SteamStoreClient(client).popular_upcoming("CN"))
+        self.assertEqual([r["appid"] for r in rows], [5157680])
+        self.assertTrue(rows[0]["capsule"].startswith("https://"))
+
+    def test_popular_upcoming_handles_a_missing_section(self) -> None:
+        client, _ = self._client({})
+        self.assertEqual(asyncio.run(SteamStoreClient(client).popular_upcoming("CN")), [])
+
+    def test_popular_upcoming_falls_back_to_search(self) -> None:
+        # The shelf API only exists on the global host, which is unreachable
+        # from some regions, so the search filter must take over.
+        html = (
+            '<a class="search_result_row" data-ds-appid="5157680" href="x">'
+            '<span class="title">DIY Dadish</span>'
+            '<div class="discount_final_price"></div></a>'
+        )
+        seen: list[str] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                seen.append(str(url))
+                if "featuredcategories" in str(url):
+                    raise httpx.ConnectTimeout("")
+                return _FakeResponse({"results_html": html})
+
+        rows = asyncio.run(SteamStoreClient(_Client()).popular_upcoming("CN"))
+        self.assertEqual([r["appid"] for r in rows], [5157680])
+        self.assertTrue(any("featuredcategories" in u for u in seen))
+        self.assertTrue(any("/search/results/" in u for u in seen))
+
+    def test_a_failed_shelf_fallback_still_raises(self) -> None:
+        class _Boom:
+            async def get(self, *args, **kwargs):
+                raise httpx.ConnectTimeout("")
+
+        with self.assertRaises(SteamApiError):
+            asyncio.run(SteamStoreClient(_Boom()).popular_upcoming("CN"))
+
+    def test_listing_errors_become_domain_errors(self) -> None:
+        class _Boom:
+            async def get(self, *args, **kwargs):
+                raise httpx.ConnectTimeout("")
+
+        with self.assertRaises(SteamApiError):
+            asyncio.run(SteamStoreClient(_Boom()).popular_new("CN", 5))
+        with self.assertRaises(SteamApiError):
+            asyncio.run(SteamStoreClient(_Boom()).popular_upcoming("CN"))
+
+
+class FreeGameListingTests(unittest.TestCase):
+    """Free games must survive the rankings without a bogus historical low."""
+
+    ROW = {"appid": 730, "name": "CS2", "final": "", "original": "", "discount": 0, "capsule": ""}
+
+    def test_build_deal_item_keeps_free_rows_when_asked(self) -> None:
+        # A discount listing has nothing to show for a free game, but a
+        # ranking would be wrong to omit the most played games on Steam.
+        self.assertIsNone(build_deal_item(self.ROW, None))
+        kept = build_deal_item(self.ROW, None, allow_free=True)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept.price.formatted_current, "\u514d\u8d39\u6e38\u73a9")
+
+    def test_paid_rows_are_unaffected(self) -> None:
+        row = {**self.ROW, "final": "\u00a533.00"}
+        kept = build_deal_item(row, None)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept.price.formatted_current, "\u00a533.00")
+
+    def test_service_drops_the_lowest_price_for_free_games(self) -> None:
+        # Heybox reports a figure for a paid edition of the same title, which
+        # rendered as "史低 96" beside a free-to-play game.
+        service = _ranking_service(
+            LowestPrice(
+                value=Decimal("96"),
+                currency="CNY",
+                recorded_on="2020-01-01",
+                discount_percent=50,
+            )
+        )
+        items = asyncio.run(service._enrich_rows([dict(self.ROW)], "none"))
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0].lowest)
+        self.assertEqual(items[0].price.formatted_current, "\u514d\u8d39\u6e38\u73a9")
+
+    def test_service_keeps_the_lowest_price_for_paid_games(self) -> None:
+        lowest = LowestPrice(
+            value=Decimal("20"),
+            currency="CNY",
+            recorded_on="2023-06-01",
+            discount_percent=60,
+        )
+        service = _ranking_service(lowest)
+        row = {**self.ROW, "final": "\u00a533.00"}
+        items = asyncio.run(service._enrich_rows([row], "none"))
+        self.assertEqual(items[0].lowest, lowest)
+
+
+class _RankingStore:
+    """Minimal store stub for the ranking enrichment path."""
+
+    async def get_items(self, appids, country):  # noqa: ANN001, ANN201
+        return {}
+
+
+def _ranking_service(lowest: LowestPrice) -> SteamDealService:
+    """Build a service wired for the ranking enrichment path.
+
+    Args:
+        lowest: Value the stubbed Heybox history lookup returns.
+
+    Returns:
+        A service whose only collaborator is a store stub and a fixed lowest
+        price lookup.
+    """
+    service = SteamDealService.__new__(SteamDealService)
+    service.store = _RankingStore()  # type: ignore[assignment]
+    service.country = "CN"
+
+    async def _fake_lowest(appid):  # noqa: ANN001, ANN202
+        return lowest
+
+    service._safe_lowest = _fake_lowest  # type: ignore[assignment]
+    return service
 
 
 if __name__ == "__main__":
