@@ -201,9 +201,10 @@ class HeyboxFallbackTests(unittest.TestCase):
 
 
 class _FakeResponse:
-    def __init__(self, payload, status: int = 200) -> None:
+    def __init__(self, payload, status: int = 200, text: str = "") -> None:
         self._payload = payload
         self.status_code = status
+        self.text = text
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -463,28 +464,107 @@ class PopularListingTests(unittest.TestCase):
 
         return _C(), log
 
-    def test_popular_new_requests_the_popularnew_filter(self) -> None:
-        client, calls = self._client({"results_html": ""})
-        asyncio.run(SteamStoreClient(client).popular_new("CN", 5))
-        params = calls[0][1]
-        self.assertEqual(params["filter"], "popularnew")
-        # The plain newreleases filter returns long-established games such as
-        # GTA V, so it must not be used for a "new" ranking.
-        self.assertNotEqual(params.get("filter"), "newreleases")
+    EXPLORE_HTML = (
+        '<a href="https://store.steampowered.com/app/5120650/_/" class="tab_item  " '
+        'data-ds-appid="5120650" data-ds-tagids="[597]">'
+        '<div class="tab_item_cap">'
+        '<img class="tab_item_cap_img" src="https://cdn/5120650/capsule.jpg" alt="\u82b1\u7816">'
+        "</div>"
+        '<div class="discount_block tab_item_discount" data-discount="10">'
+        '<div class="discount_original_price">\u00a522.00</div>'
+        '<div class="discount_final_price">\u00a519.80</div></div>'
+        '<div class="tab_item_content"><div class="tab_item_name">\u82b1\u7816\u516c\u53f8</div>'
+        "</div></a>"
+    )
+
+    def test_popular_new_reads_the_explore_page(self) -> None:
+        # The explore page is the only source: no search parameter combination
+        # reproduces its ranking.
+        page = self.EXPLORE_HTML
+
+        class _Client:
+            def __init__(self):
+                self.urls = []
+
+            async def get(self, url, params=None, **kwargs):
+                self.urls.append(str(url))
+                return _FakeResponse({}, text=page)
+
+        client = _Client()
+        rows = asyncio.run(SteamStoreClient(client).popular_new("CN", 10))
+        self.assertTrue(any("/explore/new/" in u for u in client.urls))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["appid"], 5120650)
+        self.assertEqual(rows[0]["name"], "\u82b1\u7816\u516c\u53f8")
+        self.assertEqual(rows[0]["final"], "\u00a519.80")
+        self.assertEqual(rows[0]["discount"], 10)
+        self.assertTrue(rows[0]["capsule"].startswith("https://"))
 
     def test_popular_new_parses_rows_without_a_discount(self) -> None:
-        # Most popular games are at full price; requiring a discount would
-        # silently drop them from the list.
+        # Plenty of new games are at full price and must not be dropped.
         html = (
-            '<a class="search_result_row" data-ds-appid="730" href="x">'
-            '<span class="title">Counter-Strike 2</span>'
-            '<div class="discount_final_price">\u514d\u8d39\u6e38\u73a9</div></a>'
+            '<a class="tab_item" data-ds-appid="730" href="x">'
+            '<div class="tab_item_cap"><img class="tab_item_cap_img" src="https://cdn/a.jpg"></div>'
+            '<div class="discount_block tab_item_discount" data-discount="0">'
+            '<div class="discount_final_price">\u00a533.00</div></div>'
+            '<div class="tab_item_name">Some Game</div></a>'
         )
-        client, _ = self._client({"results_html": html})
-        rows = asyncio.run(SteamStoreClient(client).popular_new("CN", 5))
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                return _FakeResponse({}, text=html)
+
+        rows = asyncio.run(SteamStoreClient(_Client()).popular_new("CN", 10))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["appid"], 730)
         self.assertEqual(rows[0]["discount"], 0)
+
+    def test_popular_new_skips_bundles(self) -> None:
+        html = (
+            '<a class="tab_item" data-ds-appid="100,200" href="x">'
+            '<div class="tab_item_name">Bundle</div></a>'
+            '<a class="tab_item" data-ds-appid="300" href="x">'
+            '<div class="tab_item_name">Real Game</div></a>'
+        )
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                return _FakeResponse({}, text=html)
+
+        rows = asyncio.run(SteamStoreClient(_Client()).popular_new("CN", 10))
+        self.assertEqual([r["appid"] for r in rows], [300])
+
+    def test_popular_new_falls_back_to_search_when_page_is_unreachable(self) -> None:
+        # The explore page only exists on the global host, which is unreachable
+        # from some regions.
+        search_html = (
+            '<a class="search_result_row" data-ds-appid="1260320" href="x">'
+            '<span class="title">Party Animals</span>'
+            '<div class="discount_final_price">\u00a549.00</div></a>'
+        )
+        seen: list[str] = []
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                seen.append(str(url))
+                if "/explore/new/" in str(url):
+                    raise httpx.ConnectTimeout("")
+                return _FakeResponse({"results_html": search_html})
+
+        store = SteamStoreClient(_Client())
+        rows = asyncio.run(store.popular_new("CN", 10))
+        self.assertEqual([r["appid"] for r in rows], [1260320])
+        self.assertIsNotNone(store.last_fallback_reason)
+
+    def test_a_healthy_page_leaves_no_fallback_reason(self) -> None:
+        page = self.EXPLORE_HTML
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                return _FakeResponse({}, text=page)
+
+        store = SteamStoreClient(_Client())
+        asyncio.run(store.popular_new("CN", 10))
+        self.assertIsNone(store.last_fallback_reason)
 
     def test_popular_upcoming_reads_the_storefront_shelf(self) -> None:
         payload = {

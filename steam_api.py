@@ -47,6 +47,9 @@ STEAM_SEARCH_BASES = (
 )
 STEAM_SEARCH_PATH = "/search/results/"
 STEAM_SEARCH_RESULTS_URL = STEAM_SEARCH_BASES[0] + STEAM_SEARCH_PATH
+# The 热门新品 ranking lives only on this server-rendered page. No search
+# parameter combination reproduces it; see popular_new.
+STEAM_EXPLORE_NEW_URL = "https://store.steampowered.com/explore/new/"
 STEAM_FEATURED_CATEGORIES_URL = "https://store.steampowered.com/api/featuredcategories/"
 # JSON storefront search, used only as a Heybox outage fallback. The older
 # /search/suggest endpoint returns HTML and no longer answers JSON, so this is
@@ -79,6 +82,12 @@ _CAPSULE_RE = re.compile(r'<div class="search_capsule">\s*<img src="([^"]+)"')
 _DISCOUNT_RE = re.compile(r'data-discount="(\d+)"')
 _FINAL_RE = re.compile(r'discount_final_price">([^<]*)<')
 _ORIGINAL_RE = re.compile(r'discount_original_price">([^<]*)<')
+# The explore page nests its rows in tab_item anchors whose attributes carry
+# the appid, so both the opening tag and the body are needed.
+_TAB_ITEM_RE = re.compile(r'<a\b[^>]*class="tab_item[^"]*"[^>]*>(.*?)</a>', re.DOTALL)
+_TAB_NAME_RE = re.compile(r'tab_item_name">([^<]+)<')
+_TAB_CAP_RE = re.compile(r'tab_item_cap_img"[^>]*src="([^"]+)"')
+_TAB_DISCOUNT_RE = re.compile(r'data-discount="(\d+)"')
 
 
 class SteamApiError(RuntimeError):
@@ -336,11 +345,14 @@ class SteamStoreClient:
         return await self._search_json(params, "Steam 特惠列表")
 
     async def popular_new(self, country: str = "CN", limit: int = 10) -> list[dict[str, Any]]:
-        """Fetch Steam's popular new releases.
+        """Fetch Steam's 热门新品 (popular new releases) ranking.
 
-        The ``popularnew`` filter is Steam's own popularity ordering for recent
-        releases. It is deliberately not the ``newreleases`` filter, which
-        returns long-established games (GTA V, Apex Legends) in release order.
+        This is the list the store shows on ``/explore/new/``. It is *not*
+        reachable through the search endpoint: every ``filter``/``sort_by``
+        combination was measured against the store page and overlapped it on
+        0 of 10 rows, so the page HTML is the only source. In particular the
+        ``popularnew`` search filter is wrong for this, as it ranks by overall
+        popularity and returns long-lived games such as CS2 and GTA V.
 
         Args:
             country: Steam storefront country code.
@@ -350,13 +362,35 @@ class SteamStoreClient:
             Row dicts with appid, name, capsule and price text.
 
         Raises:
-            SteamApiError: If the listing endpoint fails on every attempt.
+            SteamApiError: If the page cannot be fetched and the fallback fails.
         """
+        wanted = max(limit, 1)
+        try:
+            response = await self.client.get(
+                STEAM_EXPLORE_NEW_URL,
+                params={"l": self.language, "cc": country},
+            )
+            response.raise_for_status()
+            # The page ships both tabs as one HTML document, so parse the lot
+            # and keep the order the store itself uses.
+            rows = parse_explore_tab_items(response.text)
+        except Exception as exc:  # noqa: BLE001 - fallback below
+            rows = []
+            reason = _describe_error(exc)
+        else:
+            reason = ""
+
+        if rows:
+            return rows[:wanted]
+
+        # The explore page only exists on the global host, which is unreachable
+        # from some regions. Fall back to the search filter so the command still
+        # answers, and record it so the caller can say so.
         body = await self._search_json(
             {
                 "query": "",
                 "start": 0,
-                "count": min(max(limit, 1) * 2, _MAX_PAGE_SIZE),
+                "count": min(wanted * 2, _MAX_PAGE_SIZE),
                 "filter": "popularnew",
                 "infinite": 1,
                 "cc": country,
@@ -364,7 +398,8 @@ class SteamStoreClient:
             },
             "Steam 热门新品",
         )
-        return _parse_specials_page(body.get("results_html") or "")[: max(limit, 1)]
+        self.last_fallback_reason = reason or "店铺页面未返回条目"
+        return _parse_specials_page(body.get("results_html") or "")[:wanted]
 
     async def popular_upcoming(self, country: str = "CN") -> list[dict[str, Any]]:
         """Fetch Steam's curated upcoming releases.
@@ -695,6 +730,49 @@ async def download_image(client: httpx.AsyncClient, url: str) -> bytes | None:
         return response.content
     except Exception:  # noqa: BLE001 - a missing image must not break the card
         return None
+
+
+def parse_explore_tab_items(page: str) -> list[dict[str, Any]]:
+    """Extract game rows from the ``/explore/new/`` page.
+
+    Every attribute sits on the opening ``<a>`` tag, so the whole tag has to be
+    matched rather than just the element body. The page ships both the 热门新品
+    and 新品 tabs in one document; they are returned in document order, which is
+    the order the store displays them in.
+
+    Args:
+        page: Raw HTML of the explore page.
+
+    Returns:
+        Row dicts with appid, name, capsule, discount and price text.
+    """
+    rows: list[dict[str, Any]] = []
+    for match in _TAB_ITEM_RE.finditer(page):
+        tag, body = match.group(0), match.group(1)
+        appid_match = _APPID_RE.search(tag)
+        name_match = _TAB_NAME_RE.search(body)
+        if not appid_match or not name_match:
+            continue
+        # Bundles carry a comma separated appid list and have no single price.
+        if "," in appid_match.group(1):
+            continue
+        capsule_match = _TAB_CAP_RE.search(body)
+        discount_match = _TAB_DISCOUNT_RE.search(body)
+        final_match = _FINAL_RE.search(body)
+        original_match = _ORIGINAL_RE.search(body)
+        rows.append(
+            {
+                "appid": int(appid_match.group(1)),
+                "name": html.unescape(name_match.group(1)).strip(),
+                "capsule": capsule_match.group(1) if capsule_match else "",
+                "discount": int(discount_match.group(1)) if discount_match else 0,
+                "final": html.unescape(final_match.group(1)).strip() if final_match else "",
+                "original": html.unescape(original_match.group(1)).strip()
+                if original_match
+                else "",
+            }
+        )
+    return rows
 
 
 def _parse_specials_page(results_html: str) -> list[dict[str, Any]]:

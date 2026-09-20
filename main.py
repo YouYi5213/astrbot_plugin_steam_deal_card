@@ -18,7 +18,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -340,11 +340,16 @@ class SteamDealCardPlugin(Star):
         try:
             wanted = int(text) if text.isdigit() and int(text) > 0 else None
             items = await self.service.popular_new(wanted)
+            degraded = self.service.store.last_fallback_reason
             image = await self.service.render_ranking(
                 items,
                 title="Steam 热门新品",
                 subtitle=f"共 {len(items)} 款 · 数据来自 Steam 商店",
-                note="按 Steam 热门新品榜排序，免费游戏显示为「免费游玩」",
+                note=(
+                    "店铺「热门新品」页面暂时无法访问，以下为搜索接口的近似结果"
+                    if degraded
+                    else "取自 Steam 商店「热门新品」，免费游戏显示为「免费游玩」"
+                ),
                 show_lowest=True,
             )
         except LookupError as exc:

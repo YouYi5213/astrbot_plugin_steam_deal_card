@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.1
+
+- **修正 `steam热门新品` 取错了榜**。上一版用的商店搜索 `popularnew` 排序是
+  **总人气**排序，返回的是 WARDOGS、CS2、PUBG、GTA V 这类长期在线的老游戏，
+  根本不是新品。现在改为照实解析商店「热门新品」页面
+  （`store.steampowered.com/explore/new/`），得到的是花砖公司、夜之海、
+  收冠之战、无尽帝国 2 这样真正的新游。
+- 说明这个榜为什么不能用搜索接口代替：把 `newreleases`、`popularnew`、
+  `Reviews_DESC`、`Released_DESC` 等参数组合在两个站点上逐个试过，与店铺页
+  的重合度是 **0/10**。该榜只存在于页面 HTML 中，因此页面不可达时会退回搜索
+  结果，并在卡片上注明「以下为搜索接口的近似结果」。
+- 补充实测结论：`store.steampowered.com` 与 `api.steampowered.com` 的连通性
+  **互相独立且会各自中断**（同一时刻前者 200/2.1s、后者超时 12s），上一版
+  记成"整段不可达"并不准确。
+
 ## 1.4.0
 
 - **新增 `steam热门新品`**，列出 Steam 热门新品榜（可跟数字指定条数）。

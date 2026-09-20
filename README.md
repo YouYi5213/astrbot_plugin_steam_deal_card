@@ -113,7 +113,7 @@ steam游戏 1
 | 历史最低价 | 小黑盒公开历史价格接口 |
 | 实时在线人数 | Steam `ISteamUserStats/GetNumberOfCurrentPlayers` |
 | 热度榜候选与峰值 | Steam `ISteamChartsService/GetMostPlayedGames` |
-| 热门新品榜 | Steam 商店搜索 `filter=popularnew` |
+| 热门新品榜 | Steam 商店 `explore/new/` 页面（热门新品标签页） |
 | 即将推出货架 | Steam 商店 `featuredcategories` 的 `coming_soon` |
 
 折扣结束时间来自 Steam 返回的 `discount_end_date`，是商店公布的正式结束时间。
@@ -152,8 +152,10 @@ steam游戏 1
   而不是全站所有游戏里在线人数的绝对前 N。
 - 史低来自小黑盒记录，可能与其它史低数据源存在差异。
 - 免费游戏与尚未发售的游戏没有价格，卡片会显示对应状态。
-- `steam热门新品` 用的是 Steam 商店的 `popularnew` 排序。它不等于「最近发售
-  的游戏」：免费运营的长线游戏（CS2、PUBG、Apex）也会长期在榜。
+- `steam热门新品` 取自 Steam 商店「热门新品」页面，是**近期发售**的游戏里最
+  热门的，与商店页面完全一致。该榜**无法用搜索接口复现**：`newreleases`、
+  `popularnew`、`Reviews_DESC` 等参数组合与店铺页的重合度均为 0。页面不可达时
+  会退回搜索结果，卡片上会注明是近似结果。
 - `steam即将推出` **不是热度榜**。Steam 没有为未发售游戏提供热度排序——
   `comingsoon` 搜索按发售日期排，实测前 100 条无一条有评测。这里取的是商店
   首页的官方货架，只有 10 款且明显偏向小制作与 Demo，属于数据源本身的限制。
