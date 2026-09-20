@@ -6,15 +6,17 @@ import asyncio
 import io
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
+import astrbot_plugin_steam_deal_card.render as render_mod  # noqa: E402
 from astrbot_plugin_steam_deal_card.models import (  # noqa: E402
     DealItem,
     GameCandidate,
@@ -33,6 +35,7 @@ from astrbot_plugin_steam_deal_card.name_match import (  # noqa: E402
     tokenize,
 )
 from astrbot_plugin_steam_deal_card.render import (  # noqa: E402
+    _display_timezone,
     _format_end,
     _money,
     _people,
@@ -599,6 +602,91 @@ class PeopleFormatTests(unittest.TestCase):
 
     def test_hundreds_of_millions_use_yi(self) -> None:
         self.assertEqual(_people(120_000_000), "1.20 \u4ebf")
+
+
+class DisplayTimezoneTests(unittest.TestCase):
+    """The card clock must be Beijing time, and must survive a missing tz db."""
+
+    def test_resolves_to_an_eight_hour_offset(self) -> None:
+        tz = _display_timezone()
+        offset = datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone(tz).utcoffset()
+        self.assertEqual(offset, timedelta(hours=8))
+
+    def test_never_raises_without_a_tz_database(self) -> None:
+        # Slim images ship no tzdata; the plugin must still render. Forcing the
+        # lookup to fail proves the fallback rather than the system database.
+        with patch.object(render_mod, "ZoneInfo", side_effect=KeyError("no tzdata")):
+            self.assertEqual(_display_timezone().utcoffset(None), timedelta(hours=8))
+
+    def test_utc_midnight_is_eight_in_the_morning(self) -> None:
+        midnight = datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(midnight.astimezone(_display_timezone()).strftime("%H:%M"), "08:00")
+
+    def test_evening_utc_rolls_into_the_next_day(self) -> None:
+        # 20:00 UTC is already the next morning in Beijing.
+        evening = datetime(2026, 9, 20, 20, 0, tzinfo=timezone.utc)
+        shifted = evening.astimezone(_display_timezone())
+        self.assertEqual(shifted.strftime("%m-%d %H:%M"), "09-21 04:00")
+
+    def test_naive_datetime_is_accepted(self) -> None:
+        # render_players_card takes `now` for tests; a naive value must not
+        # crash astimezone.
+        png = render_players_card(
+            [PlayerCount(1, "X", players=5, rank=1)], now=datetime(2026, 9, 20, 5, 0)
+        )
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_fallback_matches_the_real_zone(self) -> None:
+        # The fixed offset must equal whatever the tz database reports, or the
+        # stamp would differ between deployment images.
+        real = _display_timezone()
+        moment = datetime(2026, 9, 20, 5, 0, tzinfo=timezone.utc)
+        with patch.object(render_mod, "ZoneInfo", side_effect=KeyError("no tzdata")):
+            fallback = _display_timezone()
+        self.assertEqual(moment.astimezone(real), moment.astimezone(fallback))
+
+    def test_card_stamp_uses_beijing_time(self) -> None:
+        # 05:00 UTC and 13:00+08:00 are the same instant, so the two cards must
+        # be pixel-identical. A UTC stamp would compare the wrong clock.
+        entry = [PlayerCount(1, "X", players=5, rank=1)]
+        as_utc = render_players_card(entry, now=datetime(2026, 9, 20, 5, 0, tzinfo=timezone.utc))
+        as_beijing = render_players_card(
+            entry, now=datetime(2026, 9, 20, 13, 0, tzinfo=timezone(timedelta(hours=8)))
+        )
+        self.assertEqual(_pixels(as_utc), _pixels(as_beijing))
+
+    def test_utc_stamp_is_not_used(self) -> None:
+        # If the card still stamped UTC, 05:00 UTC would render the same as
+        # 05:00+08:00 (which is 21:00 the previous day in UTC). They must differ.
+        entry = [PlayerCount(1, "X", players=5, rank=1)]
+        utc_morning = render_players_card(
+            entry, now=datetime(2026, 9, 20, 5, 0, tzinfo=timezone.utc)
+        )
+        beijing_morning = render_players_card(
+            entry, now=datetime(2026, 9, 20, 5, 0, tzinfo=timezone(timedelta(hours=8)))
+        )
+        self.assertNotEqual(_pixels(utc_morning), _pixels(beijing_morning))
+
+    def test_different_beijing_hours_do_differ(self) -> None:
+        # Guards the comparison above: the stamp really is drawn, so an hour
+        # change must be visible.
+        entry = [PlayerCount(1, "X", players=5, rank=1)]
+        one = render_players_card(entry, now=datetime(2026, 9, 20, 5, 0, tzinfo=timezone.utc))
+        two = render_players_card(entry, now=datetime(2026, 9, 20, 6, 0, tzinfo=timezone.utc))
+        self.assertNotEqual(_pixels(one), _pixels(two))
+
+
+def _pixels(png: bytes) -> bytes:
+    """Decode a PNG to raw pixels for exact comparison.
+
+    Args:
+        png: Encoded PNG bytes.
+
+    Returns:
+        Raw RGB pixel data.
+    """
+    with Image.open(io.BytesIO(png)) as image:
+        return image.convert("RGB").tobytes()
 
 
 def _png_bytes(size: tuple[int, int], colour: tuple[int, int, int] = (200, 60, 60)) -> bytes:

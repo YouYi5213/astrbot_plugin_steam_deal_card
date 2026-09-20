@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import io
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -26,6 +27,29 @@ DIVIDER = (52, 70, 92)
 
 CARD_WIDTH = 940
 PADDING = 28
+
+# Player counts are a "right now" figure, so the card stamps it in a local
+# clock rather than UTC. China has used a single fixed +08:00 offset since 1991
+# and observes no DST, so the fallback below is exact, not an approximation.
+_DISPLAY_TIMEZONE = "Asia/Shanghai"
+_CST = timezone(timedelta(hours=8), "CST")
+
+
+def _display_timezone() -> tzinfo:
+    """Resolve the timezone used on the player count cards.
+
+    ``zoneinfo`` needs the system tz database, which slim container images
+    often omit. Falling back to the fixed offset keeps the card rendering
+    instead of raising on those images.
+
+    Returns:
+        A tzinfo for China Standard Time.
+    """
+    try:
+        return ZoneInfo(_DISPLAY_TIMEZONE)
+    except Exception:  # noqa: BLE001 - any failure means the tz db is unusable
+        return _CST
+
 
 # Font files are searched in order; the first usable one wins.
 _FONT_CANDIDATES = (
@@ -671,13 +695,16 @@ def render_players_card(
         entries: Games already sorted by live player count, most first.
         capsules: Mapping of appid to raw capsule image bytes.
         title: Heading shown at the top of the card.
-        now: Reference time; defaults to the current UTC time.
+        now: Reference time, defaulting to the current time. Any timezone is
+            accepted; the stamp is converted to Beijing time for display.
 
     Returns:
         PNG image bytes.
     """
     capsules = capsules or {}
-    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    # Stamp in Beijing time: the audience is domestic, and a UTC clock reads as
+    # "wrong" rather than as "differently zoned".
+    stamp = (now or datetime.now(timezone.utc)).astimezone(_display_timezone())
     count = len(entries)
     # A single game is an info card, not a one-row ranking: the list layout
     # would otherwise read as "rank 1 of 1".
@@ -692,7 +719,7 @@ def render_players_card(
     draw = ImageDraw.Draw(image)
 
     draw.text((PADDING, 30), title, font=_font(38), fill=TEXT)
-    stamp_text = f"{stamp:%H:%M} UTC"
+    stamp_text = f"{stamp:%H:%M} 北京时间"
     subtitle = f"实时在线 · {stamp_text}" if single else f"共 {count} 款 · 实时数据 {stamp_text}"
     draw.text(
         (CARD_WIDTH - PADDING, 44),
