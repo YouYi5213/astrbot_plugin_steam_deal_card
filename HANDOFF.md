@@ -1,4 +1,4 @@
-﻿# 交接说明（HANDOFF）
+# 交接说明（HANDOFF）
 
 > 这份文件是给「新会话 / 压缩上下文后」快速恢复状态用的。
 > 它记录的是**当前真实状态与踩过的坑**，不是开发计划。
@@ -82,7 +82,29 @@ cd astrbot_plugin_steam_deal_card
 python -m unittest discover -s tests -t .
 python -m ruff check .
 python -m ruff format --check .
+python tools/clean.py --dry-run   # 看看有哪些临时文件/缓存
+python tools/clean.py             # 清掉它们
 ```
+
+### 关于「缓存越来越多」
+
+**插件本身不写任何磁盘缓存**：唯一的缓存是 `render.py` 里的 `_font_cache`，
+一个内存字典，重启即清空。没有 tempfile、没有 mkdir、没有落盘。
+
+所以服务器上唯一会生成的是 Python 自己的 `__pycache__`，而它是**有界的**：
+每个模块一个 `.pyc`，源码变了就覆盖，不会累积。实测部署目录总共 224 KB，
+其中 `__pycache__` 196 KB。**服务器端不需要定时清理**，发布流程第 6 步
+删一次已经足够，而且删它只是让下次启动慢一点点。
+
+会累积的是**开发时的临时文件**：一次性探测脚本和渲染样图。约定是
+- 都放在**工作区根目录**（不是插件目录内），以 `_` 开头；
+- `.gitignore` 已覆盖 `/_*.py`、`/_*.txt`、`/_*.png`、`/_scratch/`，
+  所以 `git add -A` 不会误提交；
+- 用 `python tools/clean.py` 一次清掉，不必逐个删。
+
+`tools/clean.py` 的作用范围**刻意收窄**：只清本插件目录内的缓存 + 工作区根目录
+的 `_*` 临时文件。工作区里还有别的项目，它不会碰。`tests/test_clean_tool.py`
+锁住了这条性质（不会删 `__init__.py`、`_conf_schema.json`，也不会碰兄弟目录）。
 
 ## 文件结构
 
@@ -94,7 +116,8 @@ python -m ruff format --check .
 | `models.py` | `GameCard` / `DealItem` / `PlayerCount` 等 dataclass |
 | `render.py` | Pillow 渲染三张卡片 + 北京时间处理 |
 | `name_match.py` | 中英跨语言匹配打分 |
-| `tests/` | 192 个测试；`test_command_binding.py` 用 AST 锁命令契约 |
+| `tools/clean.py` | 清理开发临时文件与本目录缓存 |
+| `tests/` | 300 个测试；`test_command_binding.py` 用 AST 锁命令契约 |
 
 ## 待办 / 未做
 
@@ -110,7 +133,7 @@ python -m ruff format --check .
 2. 同步 `main.py` 的 `PLUGIN_VERSION` 与 `metadata.yaml` 的 `version`
 3. `CHANGELOG.md` 加条目
 4. `git add -A && git commit && git push origin main`
-5. SFTP 传 `main.py/render.py/models.py/service.py/steam_api.py/metadata.yaml/CHANGELOG.md/_conf_schema.json`
-6. `rm -rf <插件目录>/__pycache__`
+5. SFTP 传 `main.py/render.py/models.py/service.py/steam_api.py/name_match.py/metadata.yaml/CHANGELOG.md/_conf_schema.json`
+6. `rm -rf <插件目录>/__pycache__`（唯一需要清的，见上文）
 7. `docker restart astrbot`，等约 28 秒
 8. `docker logs astrbot --tail 400 | grep -i steam_deal_card` 确认版本号

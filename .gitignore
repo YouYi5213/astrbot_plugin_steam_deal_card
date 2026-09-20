@@ -13,6 +13,11 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Scratch output from manually eyeballing rendered cards. The plugin never
-# writes these; they only exist while developing the renderers.
+# Scratch output from manually eyeballing rendered cards and from one-off
+# probes against the live Steam/Heybox endpoints. The plugin itself writes
+# nothing to disk, so none of this is ever produced at runtime; it only exists
+# while developing. Kept out of git so a stray `git add -A` cannot pick it up.
 /_*.png
+/_*.py
+/_*.txt
+/_scratch/
