@@ -18,7 +18,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.3.2"
+PLUGIN_VERSION = "1.3.3"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -27,7 +27,9 @@ PLUGIN_DESCRIPTION = (
 
 # The official storefront is often unreachable from mainland China, so the
 # card also links a Heybox page, which mirrors every appid and needs no login.
-STEAM_MIRROR_URL_TEMPLATE = "https://www.xiaoheihe.cn/app/topic/game/{appid}"
+# The "/pc/" segment is required: without it the path is ignored by the site's
+# single-page app and resolves to an unrelated landing page.
+STEAM_MIRROR_URL_TEMPLATE = "https://www.xiaoheihe.cn/app/topic/game/pc/{appid}"
 
 # Command matching uses regex filters rather than command filters on purpose.
 # AstrBot's CommandFilter requires the message to carry the configured

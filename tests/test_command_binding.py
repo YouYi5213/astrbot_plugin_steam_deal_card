@@ -554,6 +554,24 @@ class StoreLinkDeliveryTests(unittest.TestCase):
         self.assertIn("413150", url)
         self.assertTrue(url.startswith("https://"))
 
+    def test_mirror_url_keeps_the_pc_segment(self) -> None:
+        # Without "/pc/" Heybox's SPA ignores the path and lands on an
+        # unrelated page, which shipped as a wrong link once already.
+        card = plugin_main.GameCard(105600, "Terraria", None, None)
+        self.assertEqual(
+            plugin_main._mirror_url(card),
+            "https://www.xiaoheihe.cn/app/topic/game/pc/105600",
+        )
+        self.assertIn("/topic/game/pc/", plugin_main.STEAM_MIRROR_URL_TEMPLATE)
+
+    def test_mirror_url_matches_for_a_second_game(self) -> None:
+        # Mirrors the verified Stardew Valley page.
+        card = plugin_main.GameCard(413150, "Stardew Valley", None, None)
+        self.assertEqual(
+            plugin_main._mirror_url(card),
+            "https://www.xiaoheihe.cn/app/topic/game/pc/413150",
+        )
+
     def test_caption_never_repeats_a_url(self) -> None:
         # A card whose appid cannot build a mirror must not duplicate the
         # official link.
