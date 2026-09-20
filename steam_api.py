@@ -248,22 +248,33 @@ class SteamStoreClient:
         count = (body or {}).get("response", {}).get("player_count")
         return count if isinstance(count, int) and count >= 0 else None
 
-    async def most_played(self, limit: int = 100) -> list[dict[str, int]]:
+    async def most_played(self, limit: int = 100) -> list[dict[str, Any]]:
         """Fetch Steam's most played chart.
 
-        The chart ranks by the day's peak, not by the live count, so treat the
+        The chart ranks by ``peak_in_game``, not by the live count, so treat the
         result as a candidate pool to price against ``current_players`` rather
         than as an ordering to display.
+
+        ``peak_in_game`` covers one completed day, named by the response's
+        ``rollup_date``, and that day is the previous one: measured on
+        2026-09-20 14:30 UTC the field read 2026-09-19, i.e. 38.5 hours earlier.
+        Steam's website shows a different, same-day figure under a "Peak Today"
+        column, but this endpoint does not expose it.
 
         Args:
             limit: Maximum number of rows to return.
 
         Returns:
-            Row dicts with ``appid`` and ``peak_in_game``, in chart order.
+            Row dicts with ``appid``, ``peak_in_game`` and ``rollup_date``
+            (an epoch second, 0 when absent), in chart order.
         """
         body = await self._api_get(STEAM_MOST_PLAYED_PATH)
-        ranks = (body or {}).get("response", {}).get("ranks") or []
-        rows: list[dict[str, int]] = []
+        response = (body or {}).get("response") or {}
+        ranks = response.get("ranks") or []
+        rollup = response.get("rollup_date")
+        rollup_date = rollup if isinstance(rollup, int) and not isinstance(rollup, bool) else 0
+
+        rows: list[dict[str, Any]] = []
         for row in ranks:
             # Guard the shape: an unexpected row must not take down the list.
             if not isinstance(row, dict):
@@ -276,6 +287,7 @@ class SteamStoreClient:
                 {
                     "appid": appid,
                     "peak_in_game": peak if isinstance(peak, int) else 0,
+                    "rollup_date": rollup_date,
                 }
             )
         return rows[: max(limit, 1)]
@@ -1113,6 +1125,27 @@ def _format_release_date(value: Any) -> str:
         return ""
     try:
         return datetime.fromtimestamp(float(stamp), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _format_rollup_date(value: Any) -> str:
+    """Format the most-played chart's rollup date as a short date string.
+
+    The chart figure describes one completed day rather than the current one, so
+    the label carries the day it belongs to.
+
+    Args:
+        value: Unix timestamp from the chart response's ``rollup_date``.
+
+    Returns:
+        A ``MM-DD`` string, or an empty string when unavailable.
+    """
+    stamp = to_decimal(value)
+    if stamp is None or stamp <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(stamp), tz=timezone.utc).strftime("%m-%d")
     except (OverflowError, OSError, ValueError):
         return ""
 

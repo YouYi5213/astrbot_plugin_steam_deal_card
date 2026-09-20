@@ -1000,11 +1000,16 @@ def render_players_card(
 
         # The chart figure is a separate quantity from the live count (it can
         # even read lower), so it is labelled as Steam's peak rather than
-        # anything that would imply a second live reading.
-        if entry.peak_today:
+        # anything that would imply a second live reading. It covers one
+        # completed day, so the label carries that date; without it "峰值" reads
+        # as today's, which it is not.
+        if entry.peak:
+            peak_text = f"Steam 峰值 {_people(entry.peak)}"
+            if entry.peak_date:
+                peak_text += f"（{entry.peak_date}）"
             draw.text(
                 (name_x, peak_y),
-                f"Steam 峰值 {_people(entry.peak_today)}",
+                _truncate(draw, peak_text, meta_font, name_width),
                 font=meta_font,
                 fill=TEXT_FAINT,
             )

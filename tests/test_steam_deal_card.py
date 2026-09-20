@@ -989,8 +989,10 @@ def _png_bytes(size: tuple[int, int], colour: tuple[int, int, int] = (200, 60, 6
 class PlayerRenderTests(unittest.TestCase):
     def _entries(self) -> list[PlayerCount]:
         return [
-            PlayerCount(730, "Counter-Strike 2", players=498887, peak_today=1317931, rank=1),
-            PlayerCount(570, "Dota 2", players=423263, peak_today=860350, rank=2),
+            PlayerCount(
+                730, "Counter-Strike 2", players=498887, peak=1317931, peak_date="09-19", rank=1
+            ),
+            PlayerCount(570, "Dota 2", players=423263, peak=860350, peak_date="09-19", rank=2),
             PlayerCount(1, GAME_CN, players=12, rank=3),
         ]
 
@@ -1009,7 +1011,7 @@ class PlayerRenderTests(unittest.TestCase):
         self.assertTrue(png.startswith(b"\x89PNG"))
 
     def test_renders_without_a_peak(self) -> None:
-        png = render_players_card([PlayerCount(1, GAME_CN, players=5, peak_today=None, rank=1)])
+        png = render_players_card([PlayerCount(1, GAME_CN, players=5, peak=None, rank=1)])
         self.assertTrue(png.startswith(b"\x89PNG"))
 
     def test_renders_a_long_name(self) -> None:
@@ -1119,8 +1121,33 @@ class TopPlayersTests(unittest.TestCase):
         entries = asyncio.run(
             _service(_StubStore(chart, {1: 5}, {1: {"name": "A"}})).top_players(1)
         )
-        self.assertEqual(entries[0].peak_today, 999)
+        self.assertEqual(entries[0].peak, 999)
         self.assertEqual(entries[0].players, 5)
+
+    def test_the_peak_carries_the_day_it_covers(self) -> None:
+        # The chart figure is a completed day's peak, not today's, so the entry
+        # has to say which day it belongs to.
+        # 1789776000 = 2026-09-19 00:00:00 UTC
+        chart = [{"appid": 1, "peak_in_game": 999, "rollup_date": 1789776000}]
+        entries = asyncio.run(
+            _service(_StubStore(chart, {1: 5}, {1: {"name": "A"}})).top_players(1)
+        )
+        self.assertEqual(entries[0].peak_date, "09-19")
+
+    def test_a_missing_rollup_date_leaves_the_label_bare(self) -> None:
+        chart = [{"appid": 1, "peak_in_game": 999}]
+        entries = asyncio.run(
+            _service(_StubStore(chart, {1: 5}, {1: {"name": "A"}})).top_players(1)
+        )
+        self.assertEqual(entries[0].peak_date, "")
+
+    def test_a_single_lookup_also_carries_the_peak_date(self) -> None:
+        chart = [{"appid": 730, "peak_in_game": 999, "rollup_date": 1789776000}]
+        entry = asyncio.run(
+            _service(_StubStore(chart, {730: 5}, {730: {"name": "CS2"}})).player_count(730)
+        )
+        self.assertEqual(entry.peak, 999)
+        self.assertEqual(entry.peak_date, "09-19")
 
     def test_entries_carry_cover_urls(self) -> None:
         # The cover is what makes the card readable, so it must survive the

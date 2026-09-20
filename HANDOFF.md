@@ -49,12 +49,18 @@ steam热度 [数量]                       在线人数榜（按实时人数降�
 产生 `/AstrBot/base64:/iVBOR...` → `OSError: [Errno 36] File name too long`。
 正确写法见 `main.py` 的 `_image_result()`。测试禁止再出现 `.image_result(` 调用。
 
-### 3. Steam 热门榜不是实时人数
-`ISteamChartsService/GetMostPlayedGames` 返回 `peak_in_game`（**当日峰值**）。
-实测两者排序差异极大（GTA V 峰值第 8 / 实时第 34；Rust 峰值第 26 / 实时第 13），
+### 3. Steam 热门榜不是实时人数，也不是「今天」
+`ISteamChartsService/GetMostPlayedGames` 返回 `peak_in_game`，它是
+**上一个完整自然日的峰值**。接口同时给 `rollup_date` 指明是哪一天：
+实测 2026-09-20 14:30 UTC 抓取时读到 `2026-09-19`（38.5 小时前）。
+Steam 网页版另有一列「今日峰值 / Peak Today」（实测 CS2 为 1364115，
+而接口同日为 1317931），**那是另一个数据源，这个接口拿不到**。
+所以卡片必须带日期显示成「Steam 峰值 131.8 万（09-19）」，
+否则会被读成今天的数据 —— 这个坑踩过一次（曾写成「当日峰值」）。
+峰值与实时排序差异也极大（GTA V 峰值第 8 / 实时第 34；Rust 峰值第 26 / 实时第 13），
 比值 0.26~1.01 浮动，**无法换算**。
 所以榜单**只用来挑候选**，排序一律用 `ISteamUserStats/GetNumberOfCurrentPlayers`
-逐游戏查实时值后重排。峰值仅作参考单独标注。
+逐游戏查实时值后重排。峰值仅作参考单独标注，字段名是 `peak` / `peak_date`。
 
 ### 4. 国内服务器主机连通性
 - `api.steampowered.com`：经常不通（连接挂起）→ 必须回退 `api.steamchina.com`

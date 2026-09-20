@@ -468,20 +468,43 @@ class PlayerCountApiTests(unittest.TestCase):
     def test_most_played_parses_ranks(self) -> None:
         payload = {
             "response": {
+                "rollup_date": 1789776000,
                 "ranks": [
                     {"rank": 1, "appid": 730, "peak_in_game": 1317931},
                     {"rank": 2, "appid": 570, "peak_in_game": 860350},
-                ]
+                ],
             }
         }
         rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
         self.assertEqual(
             rows,
             [
-                {"appid": 730, "peak_in_game": 1317931},
-                {"appid": 570, "peak_in_game": 860350},
+                {"appid": 730, "peak_in_game": 1317931, "rollup_date": 1789776000},
+                {"appid": 570, "peak_in_game": 860350, "rollup_date": 1789776000},
             ],
         )
+
+    def test_most_played_carries_the_rollup_date(self) -> None:
+        # The peak describes one completed day, so the day has to survive
+        # parsing; without it the card would imply the figure is today's.
+        payload = {
+            "response": {
+                "rollup_date": 1789776000,
+                "ranks": [{"appid": 730, "peak_in_game": 1}],
+            }
+        }
+        rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
+        self.assertEqual(rows[0]["rollup_date"], 1789776000)
+
+    def test_most_played_tolerates_a_missing_or_bogus_rollup_date(self) -> None:
+        for payload in (
+            {"response": {"ranks": [{"appid": 730, "peak_in_game": 1}]}},
+            {"response": {"rollup_date": "yesterday", "ranks": [{"appid": 730}]}},
+            {"response": {"rollup_date": True, "ranks": [{"appid": 730}]}},
+        ):
+            with self.subTest(payload=payload):
+                rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
+                self.assertEqual(rows[0]["rollup_date"], 0)
 
     def test_most_played_honours_the_limit(self) -> None:
         payload = {"response": {"ranks": [{"appid": i, "peak_in_game": i} for i in range(1, 11)]}}
@@ -491,12 +514,12 @@ class PlayerCountApiTests(unittest.TestCase):
     def test_most_played_drops_rows_without_an_appid(self) -> None:
         payload = {"response": {"ranks": [{"appid": 730}, {"peak_in_game": 5}, "junk"]}}
         rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
-        self.assertEqual(rows, [{"appid": 730, "peak_in_game": 0}])
+        self.assertEqual(rows, [{"appid": 730, "peak_in_game": 0, "rollup_date": 0}])
 
     def test_most_played_keeps_a_missing_peak_as_zero(self) -> None:
         payload = {"response": {"ranks": [{"appid": 730}, {"appid": 570, "peak_in_game": 9}]}}
         rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
-        self.assertEqual(rows[0], {"appid": 730, "peak_in_game": 0})
+        self.assertEqual(rows[0]["peak_in_game"], 0)
         self.assertEqual(rows[1]["peak_in_game"], 9)
 
     def test_most_played_hits_the_documented_path(self) -> None:

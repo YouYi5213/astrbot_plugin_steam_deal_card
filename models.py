@@ -128,10 +128,11 @@ class PlayerCount:
         appid: Steam application id.
         name: Localized display name.
         players: Concurrent players right now, or None when unavailable.
-        peak_today: The peak figure Steam's most-played chart reports for this
-            game. Steam does not document the exact window and it can read
-            lower than ``players``, so it is shown as a separate labelled
-            figure and never as the live count.
+        peak: The peak figure Steam's most-played chart reports for this game.
+            It covers one completed day, not the current one, so it can read
+            lower than ``players``; it is shown as a separate labelled figure
+            and never as the live count.
+        peak_date: ``MM-DD`` of the day ``peak`` covers, empty when unknown.
         rank: Position within the requested list, assigned after sorting.
         capsule_urls: Candidate cover image URLs, best first.
     """
@@ -139,7 +140,8 @@ class PlayerCount:
     appid: int
     name: str
     players: int | None = None
-    peak_today: int | None = None
+    peak: int | None = None
+    peak_date: str = ""
     rank: int = 0
     capsule_urls: tuple[str, ...] = ()
 

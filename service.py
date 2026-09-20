@@ -23,6 +23,7 @@ from .steam_api import (
     SteamApiError,
     SteamSearchClient,
     SteamStoreClient,
+    _format_rollup_date,
     build_deal_item,
     build_game_card,
     capsule_urls,
@@ -34,8 +35,8 @@ _STEAM_URL_RE = re.compile(r"store\.steampowered\.com/app/(\d+)", re.I)
 # How many candidates to keep for the disambiguation list.
 _CANDIDATE_LIMIT = 8
 
-# The chart is ranked by the day's peak, so the live order differs; pull a
-# wider candidate pool than the user asked for and re-rank by live counts.
+# The chart is ranked by a completed day's peak, so the live order differs;
+# pull a wider candidate pool than the user asked for and re-rank by live counts.
 _CHART_POOL = 100
 # Player counts are one request per app, so cap how many run at once to stay a
 # good citizen without making the user wait for a serial loop.
@@ -391,11 +392,13 @@ class SteamDealService:
         if players is None and item is None:
             raise LookupError(f"Steam 没有 appid={appid} 的数据。")
         name = _item_name(item) or f"appid {appid}"
+        peak, peak_date = await self._safe_peak(appid)
         return PlayerCount(
             appid=appid,
             name=name,
             players=players,
-            peak_today=await self._safe_peak(appid),
+            peak=peak,
+            peak_date=peak_date,
             rank=1,
             capsule_urls=capsule_urls(item) if item else (),
         )
@@ -403,9 +406,10 @@ class SteamDealService:
     async def top_players(self, limit: int | None = None) -> list[PlayerCount]:
         """Rank games by the number of players in them right now.
 
-        Steam's most-played chart is ordered by the day's peak, which is a poor
-        proxy for the live order, so the chart is used only to pick candidates
-        and the returned list is sorted by the live counts.
+        Steam's most-played chart is ordered by a completed day's peak, which is
+        a poor proxy for the live order, so the chart is used only to pick
+        candidates and the returned list is sorted by the live counts. The peak
+        still travels with each row, carrying the day it belongs to.
 
         Args:
             limit: How many games to return.
@@ -431,12 +435,15 @@ class SteamDealService:
         )
 
         peaks = {row["appid"]: row["peak_in_game"] for row in rows}
+        # Every row shares one rollup date; it names the day the peaks cover.
+        peak_date = _format_rollup_date(rows[0].get("rollup_date"))
         ranked = [
             PlayerCount(
                 appid=appid,
                 name=_item_name(items.get(appid)) or f"appid {appid}",
                 players=players,
-                peak_today=peaks.get(appid),
+                peak=peaks.get(appid),
+                peak_date=peak_date,
                 capsule_urls=capsule_urls(items[appid]) if appid in items else (),
             )
             for appid, players in counts.items()
@@ -448,7 +455,7 @@ class SteamDealService:
         ranked.sort(key=lambda entry: entry.players or 0, reverse=True)
         return [replace(entry, rank=index) for index, entry in enumerate(ranked[:wanted], start=1)]
 
-    async def _safe_peak(self, appid: int) -> int | None:
+    async def _safe_peak(self, appid: int) -> tuple[int | None, str]:
         """Look up a game's charted peak without failing the lookup.
 
         A single game is not necessarily on the chart, and the chart call is
@@ -458,16 +465,18 @@ class SteamDealService:
             appid: Steam application id.
 
         Returns:
-            The peak figure, or None when the chart omits the game.
+            The peak figure and the ``MM-DD`` day it covers; both empty when the
+            chart omits the game or cannot be read.
         """
         try:
             rows = await self.store.most_played(_CHART_POOL)
         except Exception:  # noqa: BLE001 - context only, never fatal
-            return None
+            return None, ""
         for row in rows:
             if row["appid"] == appid:
-                return row["peak_in_game"] or None
-        return None
+                peak = row["peak_in_game"] or None
+                return peak, _format_rollup_date(row.get("rollup_date")) if peak else ""
+        return None, ""
 
     async def _player_counts(self, appids: list[int]) -> dict[int, int | None]:
         """Fetch live player counts for several apps at once.
