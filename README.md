@@ -12,6 +12,7 @@
 - **多候选选择**：`生化危机` 这类不唯一的名称会列出编号选项，回复 `1` 即可查询。
 - **图片卡片**：游戏详情卡包含封面图、当前价、原价与折扣、史低、评价、发行日期和开发商。
 - **打折列表**：列出当前促销游戏，含商品展示图、游戏名、当前价、折扣、史低和折扣结束日期。
+- **在线人数**：查询单个游戏的**实时**在线人数，或按实时人数从高到低查看热度排行。
 - **评价信息**：好评率、评测数量和「好评如潮」等 Steam 评价标签。
 - **无需 Key**：只使用 Steam 商店与公开接口，不接入 ITAD，不需要 Steam Web API Key。
 
@@ -37,6 +38,8 @@ AstrBot/data/plugins/astrbot_plugin_steam_deal_card
 steam游戏 <游戏名|appid|Steam链接>
 steam游戏 <序号>          # 从上一条候选列表中选一个
 steam打折 [数量]
+steam在线 <游戏名|appid>
+steam热度 [数量]
 ```
 
 示例：
@@ -49,12 +52,18 @@ steam游戏 105600           # 直接按 appid 查询
 steam游戏 https://store.steampowered.com/app/105600/
 steam打折                  # 默认 10 款
 steam打折 15               # 显示 15 款
+steam在线 泰拉瑞亚           # 单个游戏的实时在线人数
+steam在线 730              # 也可以按 appid
+steam热度                  # 在线人数榜，默认 20 款
+steam热度 10               # 只看前 10
 ```
 
 别名：
 
 - `steam游戏`：`steam游戏查询`、`steam查价`、`steam价格`
 - `steam打折`：`steam特惠`、`steam促销`、`steam优惠`
+- `steam在线`：`steam在线人数`、`steam人数`
+- `steam热度`：`steam热度榜`、`steam排行`、`steam在线榜`
 
 ### 多候选选择
 
@@ -81,6 +90,7 @@ steam游戏 1
 | `language` | `schinese` | Steam 商店语言，影响游戏名与描述语言 |
 | `history_country` | `cn` | 小黑盒历史价格区域，用于查询史低 |
 | `max_deals` | `10` | `steam打折` 默认显示数量 |
+| `max_players` | `20` | `steam热度` 在线人数榜默认显示数量 |
 
 ## 数据来源
 
@@ -89,6 +99,8 @@ steam游戏 1
 | 当前价格、折扣、折扣结束时间、评价、商店图 | Steam 商店公开接口 |
 | 中文游戏名 → Steam appid | 小黑盒公开搜索接口 |
 | 历史最低价 | 小黑盒公开历史价格接口 |
+| 实时在线人数 | Steam `ISteamUserStats/GetNumberOfCurrentPlayers` |
+| 热度榜候选与峰值 | Steam `ISteamChartsService/GetMostPlayedGames` |
 
 折扣结束时间来自 Steam 返回的 `discount_end_date`，是商店公布的正式结束时间。
 
@@ -102,12 +114,21 @@ steam游戏 1
   保证 `Terraria` 和 `泰拉瑞亚` 都能命中同一个 appid。
 - **批量查询**：价格、评价和图片通过 `IStoreBrowseService/GetItems` 一次性批量获取
   （50 个 appid 约 1.4 秒），因此打折列表不会因为逐个查询而变慢。
+- **在线人数与热度榜**：Steam 的热门榜接口返回的是**当日峰值** `peak_in_game`，
+  不是实时人数。实测两者的排序差异很大（`GTA V` 峰值第 8、实时第 34；
+  `Rust` 峰值第 26、实时第 13），比值在 0.26 ~ 1.01 之间浮动，无法换算。
+  因此榜单**只用来挑选候选游戏**，排序一律用 `GetNumberOfCurrentPlayers`
+  的实时值逐游戏查询后重新排序；榜单峰值作为参考信息单独标注，绝不当作实时人数展示。
+  实时人数需要逐个请求，因此并发上限为 12：实测 20 个约 2 秒，50 个约 2.4 秒。
 - **字体**：按 Windows / Linux / macOS 常见中文字体顺序自动查找，找不到时回退到
   Pillow 默认字体。如需在精简系统上使用，可将字体放到 `assets/fonts/`。
 
 ## 已知限制
 
 - 打折列表展示的是 Steam 商店「优惠」页的排序结果，不是全站两万多个折扣商品。
+- 在线人数只统计**通过 Steam 启动**的玩家，不含独立客户端、主机和离线模式。
+- `steam热度` 的候选取自 Steam 热门榜前 100，因此上榜的是「当前热门的游戏」，
+  而不是全站所有游戏里在线人数的绝对前 N。
 - 史低来自小黑盒记录，可能与其它史低数据源存在差异。
 - 免费游戏与尚未发售的游戏没有价格，卡片会显示对应状态。
 - 图片渲染需要 Pillow；渲染失败时会自动回退为文字结果。

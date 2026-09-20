@@ -25,6 +25,8 @@ from .models import (
 )
 
 STEAM_GET_ITEMS_PATH = "/IStoreBrowseService/GetItems/v1/"
+STEAM_PLAYER_COUNT_PATH = "/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+STEAM_MOST_PLAYED_PATH = "/ISteamChartsService/GetMostPlayedGames/v1/"
 # Steam answers the same API on two hosts. The global one is unreachable from
 # mainland China hosts (connect hangs until timeout) while the China one is
 # fast there, and vice versa is never a problem, so requests fail over between
@@ -170,6 +172,85 @@ class SteamStoreClient:
             return body
 
         raise SteamApiError("Steam 商店数据请求失败：" + "；".join(failures))
+
+    async def _api_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """Call a Steam Web API path, failing over between the known hosts.
+
+        Args:
+            path: API path beginning with a slash, e.g.
+                ``/ISteamUserStats/...``.
+            params: Query parameters for the request.
+
+        Returns:
+            The decoded JSON body.
+
+        Raises:
+            SteamApiError: If no host answered.
+        """
+        preferred = [self._api_base] if self._api_base else []
+        bases = preferred + [base for base in STEAM_API_BASES if base not in preferred]
+        failures: list[str] = []
+        for base in bases:
+            kwargs = {} if self._api_base else {"timeout": _HOST_PROBE_TIMEOUT}
+            try:
+                response = await self.client.get(base + path, params=params, **kwargs)
+                response.raise_for_status()
+                body = response.json()
+            except Exception as exc:  # noqa: BLE001 - try the next host
+                failures.append(f"{base}（{_describe_error(exc)}）")
+                if self._api_base == base:
+                    self._api_base = None
+                continue
+            self._api_base = base
+            return body
+
+        raise SteamApiError("Steam 数据请求失败：" + "；".join(failures))
+
+    async def current_players(self, appid: int) -> int | None:
+        """Fetch the number of players in a game right now.
+
+        Args:
+            appid: Steam application id.
+
+        Returns:
+            The concurrent player count, or None when Steam does not report one
+            (which it does for delisted and some unreleased apps).
+        """
+        body = await self._api_get(STEAM_PLAYER_COUNT_PATH, {"appid": appid})
+        count = (body or {}).get("response", {}).get("player_count")
+        return count if isinstance(count, int) and count >= 0 else None
+
+    async def most_played(self, limit: int = 100) -> list[dict[str, int]]:
+        """Fetch Steam's most played chart.
+
+        The chart ranks by the day's peak, not by the live count, so treat the
+        result as a candidate pool to price against ``current_players`` rather
+        than as an ordering to display.
+
+        Args:
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Row dicts with ``appid`` and ``peak_in_game``, in chart order.
+        """
+        body = await self._api_get(STEAM_MOST_PLAYED_PATH)
+        ranks = (body or {}).get("response", {}).get("ranks") or []
+        rows: list[dict[str, int]] = []
+        for row in ranks:
+            # Guard the shape: an unexpected row must not take down the list.
+            if not isinstance(row, dict):
+                continue
+            appid = row.get("appid")
+            if not isinstance(appid, int) or isinstance(appid, bool):
+                continue
+            peak = row.get("peak_in_game")
+            rows.append(
+                {
+                    "appid": appid,
+                    "peak_in_game": peak if isinstance(peak, int) else 0,
+                }
+            )
+        return rows[: max(limit, 1)]
 
     async def specials(self, country: str = "CN", limit: int = 20) -> list[dict[str, Any]]:
         """Fetch the current Steam specials list.

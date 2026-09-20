@@ -8,9 +8,9 @@ from dataclasses import dataclass, replace
 
 import httpx
 
-from .models import DealItem, GameCandidate, GameCard
+from .models import DealItem, GameCandidate, GameCard, PlayerCount
 from .name_match import is_confident, rank_candidates
-from .render import render_candidates, render_deals_card, render_game_card
+from .render import render_candidates, render_deals_card, render_game_card, render_players_card
 from .steam_api import (
     HeyboxClient,
     SteamApiError,
@@ -24,6 +24,13 @@ _STEAM_URL_RE = re.compile(r"store\.steampowered\.com/app/(\d+)", re.I)
 
 # How many candidates to keep for the disambiguation list.
 _CANDIDATE_LIMIT = 8
+
+# The chart is ranked by the day's peak, so the live order differs; pull a
+# wider candidate pool than the user asked for and re-rank by live counts.
+_CHART_POOL = 100
+# Player counts are one request per app, so cap how many run at once to stay a
+# good citizen without making the user wait for a serial loop.
+_PLAYER_CONCURRENCY = 12
 
 
 class LookupError(RuntimeError):
@@ -79,6 +86,7 @@ class SteamDealService:
         country: str = "CN",
         history_country: str = "cn",
         max_deals: int = 10,
+        max_players: int = 20,
     ) -> None:
         """Store the collaborators and defaults.
 
@@ -89,6 +97,7 @@ class SteamDealService:
             country: Steam storefront country code.
             history_country: Heybox region code for price history.
             max_deals: Maximum number of games on the deals card.
+            max_players: Maximum number of games on the player count card.
         """
         self.store = store
         self.heybox = heybox
@@ -96,6 +105,7 @@ class SteamDealService:
         self.country = country
         self.history_country = history_country
         self.max_deals = max(max_deals, 1)
+        self.max_players = max(max_players, 1)
 
     async def resolve_game(self, query: str) -> GameLookupResult:
         """Resolve a query into a single game or a candidate list.
@@ -218,6 +228,125 @@ class SteamDealService:
             raise LookupError("暂时没有获取到 Steam 折扣游戏。")
         return deals
 
+    async def player_count(self, appid: int) -> PlayerCount:
+        """Fetch the live player count for one game.
+
+        Args:
+            appid: Steam application id.
+
+        Returns:
+            The player count, with the game's name when Steam reports one.
+
+        Raises:
+            LookupError: If Steam has no data for the appid.
+        """
+        counts, items = await asyncio.gather(
+            self._player_counts([appid]),
+            self._safe_items([appid]),
+        )
+        players = counts.get(appid)
+        item = items.get(appid)
+        if players is None and item is None:
+            raise LookupError(f"Steam 没有 appid={appid} 的数据。")
+        name = _item_name(item) or f"appid {appid}"
+        return PlayerCount(appid=appid, name=name, players=players, rank=1)
+
+    async def top_players(self, limit: int | None = None) -> list[PlayerCount]:
+        """Rank games by the number of players in them right now.
+
+        Steam's most-played chart is ordered by the day's peak, which is a poor
+        proxy for the live order, so the chart is used only to pick candidates
+        and the returned list is sorted by the live counts.
+
+        Args:
+            limit: How many games to return.
+
+        Returns:
+            The games, most players first.
+
+        Raises:
+            LookupError: If the chart or every player count could not be read.
+        """
+        wanted = max(limit or self.max_players, 1)
+        rows = await self.store.most_played(_CHART_POOL)
+        if not rows:
+            raise LookupError("暂时没有获取到 Steam 在线人数榜。")
+
+        # The chart is already roughly ordered by popularity, so asking about
+        # its first rows is the cheapest way to find the true top N.
+        pool = rows[: min(len(rows), max(wanted * 3, wanted + 10))]
+        appids = [row["appid"] for row in pool]
+        counts, items = await asyncio.gather(
+            self._player_counts(appids),
+            self._safe_items(appids),
+        )
+
+        peaks = {row["appid"]: row["peak_in_game"] for row in rows}
+        ranked = [
+            PlayerCount(
+                appid=appid,
+                name=_item_name(items.get(appid)) or f"appid {appid}",
+                players=players,
+                peak_today=peaks.get(appid),
+            )
+            for appid, players in counts.items()
+            if players is not None
+        ]
+        if not ranked:
+            raise LookupError("暂时没有获取到 Steam 在线人数。")
+
+        ranked.sort(key=lambda entry: entry.players or 0, reverse=True)
+        return [replace(entry, rank=index) for index, entry in enumerate(ranked[:wanted], start=1)]
+
+    async def _player_counts(self, appids: list[int]) -> dict[int, int | None]:
+        """Fetch live player counts for several apps at once.
+
+        Args:
+            appids: Steam application ids.
+
+        Returns:
+            A mapping of appid to player count. Apps Steam does not report are
+            present with a None value; apps whose request failed are omitted.
+        """
+        if not appids:
+            return {}
+        gate = asyncio.Semaphore(_PLAYER_CONCURRENCY)
+
+        async def one(appid: int) -> tuple[int, int | None] | None:
+            async with gate:
+                try:
+                    return appid, await self.store.current_players(appid)
+                except Exception:  # noqa: BLE001 - one bad app must not fail the list
+                    return None
+
+        results = await asyncio.gather(*[one(appid) for appid in appids])
+        return {appid: count for result in results if result for appid, count in (result,)}
+
+    async def _safe_items(self, appids: list[int]) -> dict[int, dict]:
+        """Fetch store items, treating a failure as missing data.
+
+        Args:
+            appids: Steam application ids.
+
+        Returns:
+            A mapping of appid to raw store item, empty when the call failed.
+        """
+        try:
+            return await self.store.get_items(appids, self.country)
+        except SteamApiError:
+            return {}
+
+    async def render_players(self, entries: list[PlayerCount]) -> bytes:
+        """Render the player count card.
+
+        Args:
+            entries: Ranked player counts.
+
+        Returns:
+            PNG image bytes.
+        """
+        return await asyncio.to_thread(render_players_card, entries)
+
     async def render_game(self, card: GameCard) -> bytes:
         """Render a game card, downloading its capsule image.
 
@@ -312,3 +441,18 @@ class SteamDealService:
             return response.content
         except Exception:  # noqa: BLE001 - a missing image must not break the card
             return None
+
+
+def _item_name(item: dict | None) -> str:
+    """Read a display name out of a raw store item.
+
+    Args:
+        item: Raw store item, or None when Steam had no data.
+
+    Returns:
+        The name, or an empty string when it is unavailable.
+    """
+    if not isinstance(item, dict):
+        return ""
+    name = item.get("name")
+    return name.strip() if isinstance(name, str) else ""

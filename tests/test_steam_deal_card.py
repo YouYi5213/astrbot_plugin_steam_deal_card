@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 import sys
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
@@ -16,6 +20,7 @@ from astrbot_plugin_steam_deal_card.models import (  # noqa: E402
     GameCandidate,
     GameCard,
     LowestPrice,
+    PlayerCount,
     PriceInfo,
     ReviewSummary,
     to_decimal,
@@ -30,13 +35,19 @@ from astrbot_plugin_steam_deal_card.name_match import (  # noqa: E402
 from astrbot_plugin_steam_deal_card.render import (  # noqa: E402
     _format_end,
     _money,
+    _people,
     _truncate,
     _wrap,
     render_candidates,
     render_deals_card,
     render_game_card,
+    render_players_card,
 )
-from astrbot_plugin_steam_deal_card.service import extract_appid  # noqa: E402
+from astrbot_plugin_steam_deal_card.service import (  # noqa: E402
+    LookupError,
+    SteamDealService,
+    extract_appid,
+)
 from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
     _format_history_date,
     _parse_discount_end,
@@ -574,6 +585,210 @@ class RenderTests(unittest.TestCase):
     def test_renders_candidates_with_an_empty_query(self) -> None:
         candidates = [GameCandidate(1, GAME_CN, score=0.0)]
         self.assertTrue(render_candidates("", candidates, CANDIDATE_CMD).startswith(b"\x89PNG"))
+
+
+class PeopleFormatTests(unittest.TestCase):
+    def test_small_counts_are_plain(self) -> None:
+        self.assertEqual(_people(0), "0")
+        self.assertEqual(_people(999), "999")
+        self.assertEqual(_people(9999), "9,999")
+
+    def test_tens_of_thousands_use_wan(self) -> None:
+        self.assertEqual(_people(10_000), "1.0 \u4e07")
+        self.assertEqual(_people(498_925), "49.9 \u4e07")
+
+    def test_hundreds_of_millions_use_yi(self) -> None:
+        self.assertEqual(_people(120_000_000), "1.20 \u4ebf")
+
+
+class PlayerRenderTests(unittest.TestCase):
+    def _entries(self) -> list[PlayerCount]:
+        return [
+            PlayerCount(730, "Counter-Strike 2", players=498887, peak_today=1317931, rank=1),
+            PlayerCount(570, "Dota 2", players=423263, peak_today=860350, rank=2),
+            PlayerCount(1, GAME_CN, players=12, rank=3),
+        ]
+
+    def test_renders_a_ranking_png(self) -> None:
+        png = render_players_card(self._entries())
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertGreater(len(png), 4000)
+
+    def test_renders_a_single_entry(self) -> None:
+        png = render_players_card([PlayerCount(730, "CS2", players=1, rank=1)])
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_renders_without_a_player_count(self) -> None:
+        # Steam omits the count for some apps; the card must still render.
+        png = render_players_card([PlayerCount(1, GAME_CN, players=None, rank=1)])
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_renders_without_a_peak(self) -> None:
+        png = render_players_card([PlayerCount(1, GAME_CN, players=5, peak_today=None, rank=1)])
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_renders_a_long_name(self) -> None:
+        entry = PlayerCount(1, LONG_NAME_CN * 6, players=5, rank=1)
+        self.assertTrue(render_players_card([entry]).startswith(b"\x89PNG"))
+
+    def test_taller_cards_hold_more_rows(self) -> None:
+        short = render_players_card([PlayerCount(1, GAME_CN, players=1, rank=1)])
+        tall = render_players_card(self._entries())
+
+        def height(png: bytes) -> int:
+            return Image.open(io.BytesIO(png)).height
+
+        self.assertGreater(height(tall), height(short))
+
+
+class _StubStore:
+    """Store stub returning canned chart and player counts."""
+
+    def __init__(self, chart: list[dict], counts: dict[int, int | None], items: dict) -> None:
+        self._chart = chart
+        self._counts = counts
+        self._items = items
+        self.counted: list[int] = []
+
+    async def most_played(self, limit: int = 100) -> list[dict]:
+        return self._chart[:limit]
+
+    async def current_players(self, appid: int) -> int | None:
+        self.counted.append(appid)
+        return self._counts.get(appid)
+
+    async def get_items(self, appids, country):  # noqa: ANN001, ANN201
+        return {appid: self._items[appid] for appid in appids if appid in self._items}
+
+
+class _StubHeybox:
+    async def search(self, query):  # noqa: ANN001, ANN201
+        return []
+
+    async def lowest_price(self, appid, country="cn"):  # noqa: ANN001, ANN201
+        return None
+
+
+def _service(store: _StubStore) -> SteamDealService:
+    return SteamDealService(
+        store=store,  # type: ignore[arg-type]
+        heybox=_StubHeybox(),  # type: ignore[arg-type]
+        http=None,  # type: ignore[arg-type]
+        country="CN",
+        history_country="cn",
+        max_players=20,
+    )
+
+
+class TopPlayersTests(unittest.TestCase):
+    """The chart is peak-ordered, so the result must be re-sorted by live count."""
+
+    def test_sorts_descending_by_live_count(self) -> None:
+        # Chart order is deliberately the reverse of the live order.
+        chart = [
+            {"appid": 1, "peak_in_game": 900},
+            {"appid": 2, "peak_in_game": 800},
+            {"appid": 3, "peak_in_game": 700},
+        ]
+        counts = {1: 10, 2: 5000, 3: 300}
+        items = {1: {"name": "A"}, 2: {"name": "B"}, 3: {"name": "C"}}
+        entries = asyncio.run(_service(_StubStore(chart, counts, items)).top_players(3))
+        self.assertEqual([e.appid for e in entries], [2, 3, 1])
+        self.assertEqual([e.players for e in entries], [5000, 300, 10])
+
+    def test_assigns_ranks_after_sorting(self) -> None:
+        chart = [{"appid": 1, "peak_in_game": 9}, {"appid": 2, "peak_in_game": 8}]
+        counts = {1: 1, 2: 2}
+        items = {1: {"name": "A"}, 2: {"name": "B"}}
+        entries = asyncio.run(_service(_StubStore(chart, counts, items)).top_players(2))
+        self.assertEqual([e.rank for e in entries], [1, 2])
+        self.assertEqual(entries[0].appid, 2)
+
+    def test_keeps_the_chart_peak_for_context(self) -> None:
+        chart = [{"appid": 1, "peak_in_game": 999}]
+        entries = asyncio.run(
+            _service(_StubStore(chart, {1: 5}, {1: {"name": "A"}})).top_players(1)
+        )
+        self.assertEqual(entries[0].peak_today, 999)
+        self.assertEqual(entries[0].players, 5)
+
+    def test_limit_truncates_after_sorting(self) -> None:
+        chart = [{"appid": i, "peak_in_game": 100 - i} for i in range(1, 9)]
+        counts = {i: i * 10 for i in range(1, 9)}
+        items = {i: {"name": f"G{i}"} for i in range(1, 9)}
+        entries = asyncio.run(_service(_StubStore(chart, counts, items)).top_players(3))
+        self.assertEqual([e.appid for e in entries], [8, 7, 6])
+        self.assertEqual([e.rank for e in entries], [1, 2, 3])
+
+    def test_apps_without_a_count_are_dropped(self) -> None:
+        chart = [{"appid": 1, "peak_in_game": 5}, {"appid": 2, "peak_in_game": 4}]
+        entries = asyncio.run(
+            _service(
+                _StubStore(chart, {1: None, 2: 7}, {1: {"name": "A"}, 2: {"name": "B"}})
+            ).top_players(5)
+        )
+        self.assertEqual([e.appid for e in entries], [2])
+
+    def test_missing_name_falls_back_to_the_appid(self) -> None:
+        chart = [{"appid": 4242, "peak_in_game": 5}]
+        entries = asyncio.run(_service(_StubStore(chart, {4242: 5}, {})).top_players(1))
+        self.assertIn("4242", entries[0].name)
+
+    def test_empty_chart_raises_lookup_error(self) -> None:
+        with self.assertRaises(LookupError):
+            asyncio.run(_service(_StubStore([], {}, {})).top_players(5))
+
+    def test_all_counts_missing_raises_lookup_error(self) -> None:
+        chart = [{"appid": 1, "peak_in_game": 5}]
+        with self.assertRaises(LookupError):
+            asyncio.run(_service(_StubStore(chart, {1: None}, {1: {"name": "A"}})).top_players(5))
+
+    def test_does_not_query_the_whole_chart_for_a_small_limit(self) -> None:
+        chart = [{"appid": i, "peak_in_game": 1000 - i} for i in range(1, 60)]
+        counts = {i: i for i in range(1, 60)}
+        items = {i: {"name": f"G{i}"} for i in range(1, 60)}
+        store = _StubStore(chart, counts, items)
+        asyncio.run(_service(store).top_players(3))
+        self.assertLess(len(store.counted), len(chart))
+        self.assertGreaterEqual(len(store.counted), 3)
+
+    def test_concurrent_count_requests_are_bounded(self) -> None:
+        chart = [{"appid": i, "peak_in_game": 1} for i in range(1, 41)]
+        counts = {i: i for i in range(1, 41)}
+        items = {i: {"name": f"G{i}"} for i in range(1, 41)}
+        peak = {"now": 0}
+
+        class _CountingStore(_StubStore):
+            async def current_players(self, appid: int) -> int | None:
+                peak["now"] += 1
+                peak["max"] = max(peak.get("max", 0), peak["now"])
+                try:
+                    return await super().current_players(appid)
+                finally:
+                    peak["now"] -= 1
+
+        asyncio.run(_service(_CountingStore(chart, counts, items)).top_players(30))
+        self.assertLessEqual(peak["max"], 12)
+
+
+class PlayerCountTests(unittest.TestCase):
+    def test_single_player_count_uses_the_store_name(self) -> None:
+        store = _StubStore([], {730: 498887}, {730: {"name": "Counter-Strike 2"}})
+        entry = asyncio.run(_service(store).player_count(730))
+        self.assertEqual(entry.name, "Counter-Strike 2")
+        self.assertEqual(entry.players, 498887)
+        self.assertEqual(entry.rank, 1)
+
+    def test_single_player_count_without_store_data(self) -> None:
+        # The count alone is still useful when the store item is unavailable.
+        store = _StubStore([], {730: 123}, {})
+        entry = asyncio.run(_service(store).player_count(730))
+        self.assertEqual(entry.players, 123)
+        self.assertIn("730", entry.name)
+
+    def test_unknown_appid_raises_lookup_error(self) -> None:
+        with self.assertRaises(LookupError):
+            asyncio.run(_service(_StubStore([], {}, {})).player_count(999999))
 
 
 if __name__ == "__main__":

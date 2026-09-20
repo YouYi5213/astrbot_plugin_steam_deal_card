@@ -24,6 +24,8 @@ from astrbot_plugin_steam_deal_card.steam_api import (  # noqa: E402
     STEAM_API_BASES,
     STEAM_CAPSULE_FALLBACKS,
     STEAM_GET_ITEMS_PATH,
+    STEAM_MOST_PLAYED_PATH,
+    STEAM_PLAYER_COUNT_PATH,
     SteamApiError,
     SteamStoreClient,
     _describe_error,
@@ -387,6 +389,113 @@ class SpecialsRetryTests(unittest.TestCase):
         rows = asyncio.run(SteamStoreClient(_Client()).specials("CN", limit=5))
         self.assertEqual(len(rows), 1)
         self.assertEqual(calls, [0, 50])
+
+
+class PlayerCountApiTests(unittest.TestCase):
+    """The two player-count endpoints, including their failover behaviour."""
+
+    def _client(self, payload, calls: list | None = None, fail_on: set | None = None):
+        log = calls if calls is not None else []
+        failing = fail_on or set()
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                log.append((url, params))
+                if any(host in url for host in failing):
+                    raise httpx.ConnectTimeout("")
+                return _FakeResponse(payload)
+
+        return _Client()
+
+    def test_current_players_reads_the_count(self) -> None:
+        client = self._client({"response": {"player_count": 498925, "result": 1}})
+        store = SteamStoreClient(client)
+        self.assertEqual(asyncio.run(store.current_players(730)), 498925)
+
+    def test_current_players_hits_the_documented_path(self) -> None:
+        calls: list = []
+        client = self._client({"response": {"player_count": 1}}, calls)
+        asyncio.run(SteamStoreClient(client).current_players(570))
+        url, params = calls[0]
+        self.assertTrue(url.endswith(STEAM_PLAYER_COUNT_PATH))
+        self.assertEqual(params, {"appid": 570})
+
+    def test_missing_count_is_none_not_zero(self) -> None:
+        # Steam omits player_count for delisted apps; reporting 0 would read as
+        # "nobody is playing" rather than "not published".
+        client = self._client({"response": {"result": 42}})
+        self.assertIsNone(asyncio.run(SteamStoreClient(client).current_players(1)))
+
+    def test_non_integer_count_is_none(self) -> None:
+        client = self._client({"response": {"player_count": "lots"}})
+        self.assertIsNone(asyncio.run(SteamStoreClient(client).current_players(1)))
+
+    def test_most_played_parses_ranks(self) -> None:
+        payload = {
+            "response": {
+                "ranks": [
+                    {"rank": 1, "appid": 730, "peak_in_game": 1317931},
+                    {"rank": 2, "appid": 570, "peak_in_game": 860350},
+                ]
+            }
+        }
+        rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
+        self.assertEqual(
+            rows,
+            [
+                {"appid": 730, "peak_in_game": 1317931},
+                {"appid": 570, "peak_in_game": 860350},
+            ],
+        )
+
+    def test_most_played_honours_the_limit(self) -> None:
+        payload = {"response": {"ranks": [{"appid": i, "peak_in_game": i} for i in range(1, 11)]}}
+        rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played(3))
+        self.assertEqual([row["appid"] for row in rows], [1, 2, 3])
+
+    def test_most_played_drops_rows_without_an_appid(self) -> None:
+        payload = {"response": {"ranks": [{"appid": 730}, {"peak_in_game": 5}, "junk"]}}
+        rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
+        self.assertEqual(rows, [{"appid": 730, "peak_in_game": 0}])
+
+    def test_most_played_keeps_a_missing_peak_as_zero(self) -> None:
+        payload = {"response": {"ranks": [{"appid": 730}, {"appid": 570, "peak_in_game": 9}]}}
+        rows = asyncio.run(SteamStoreClient(self._client(payload)).most_played())
+        self.assertEqual(rows[0], {"appid": 730, "peak_in_game": 0})
+        self.assertEqual(rows[1]["peak_in_game"], 9)
+
+    def test_most_played_hits_the_documented_path(self) -> None:
+        calls: list = []
+        client = self._client({"response": {"ranks": []}}, calls)
+        asyncio.run(SteamStoreClient(client).most_played())
+        self.assertTrue(calls[0][0].endswith(STEAM_MOST_PLAYED_PATH))
+
+    def test_player_count_fails_over_to_the_china_host(self) -> None:
+        calls: list = []
+        client = self._client(
+            {"response": {"player_count": 7}}, calls, fail_on={STEAM_API_BASES[0]}
+        )
+        count = asyncio.run(SteamStoreClient(client).current_players(730))
+        self.assertEqual(count, 7)
+        self.assertEqual(len(calls), 2)
+        self.assertIn(STEAM_API_BASES[1], calls[1][0])
+
+    def test_player_count_raises_when_every_host_fails(self) -> None:
+        client = self._client({}, fail_on=set(STEAM_API_BASES))
+        with self.assertRaises(SteamApiError):
+            asyncio.run(SteamStoreClient(client).current_players(730))
+
+    def test_a_host_that_answers_later_is_remembered(self) -> None:
+        calls: list = []
+        client = self._client(
+            {"response": {"player_count": 7}}, calls, fail_on={STEAM_API_BASES[0]}
+        )
+        store = SteamStoreClient(client)
+        asyncio.run(store.current_players(730))
+        asyncio.run(store.current_players(730))
+        # Second call goes straight to the host that worked.
+        self.assertIn(STEAM_API_BASES[1], calls[-1][0])
+        self.assertEqual(len(calls), 3)
 
 
 class DescribeErrorTests(unittest.TestCase):

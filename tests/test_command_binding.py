@@ -35,6 +35,12 @@ PRICE = "steam\u67e5\u4ef7"  # steam查价
 PRICE2 = "steam\u4ef7\u683c"  # steam价格
 DEALS = "steam\u6253\u6298"  # steam打折
 DEALS2 = "steam\u7279\u60e0"  # steam特惠
+PLAYERS = "steam\u5728\u7ebf"  # steam在线
+PLAYERS_FULL = "steam\u5728\u7ebf\u4eba\u6570"  # steam在线人数
+HOT = "steam\u70ed\u5ea6"  # steam热度
+HOT_FULL = "steam\u70ed\u5ea6\u699c"  # steam热度榜
+RANK = "steam\u6392\u884c"  # steam排行
+PLAYERS_BOARD = "steam\u5728\u7ebf\u699c"  # steam在线榜
 TERRARIA = "\u6cf0\u62c9\u745e\u4e9a"  # 泰拉瑞亚
 ASKING = "\u8bf7\u95ee"  # 请问
 
@@ -217,8 +223,33 @@ class ImageDeliveryTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "_image_result"
         ]
-        # One deals handler, one game card, one candidate list.
-        self.assertEqual(len(calls), 3)
+        # deals, game card, candidate list, single player count, ranking.
+        self.assertEqual(len(calls), 5)
+
+    def test_every_image_sending_handler_uses_the_helper(self) -> None:
+        senders = [
+            node.name
+            for node in ast.walk(_MODULE)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and any(
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "_image_result"
+                for inner in ast.walk(node)
+            )
+        ]
+        self.assertEqual(
+            sorted(senders),
+            sorted(
+                [
+                    "steam_deals_command",
+                    "steam_players_command",
+                    "steam_hot_command",
+                    "_render_card",
+                    "_render_candidates",
+                ]
+            ),
+        )
 
     def test_helper_builds_a_base64_image_component(self) -> None:
         helper = next(
@@ -287,6 +318,97 @@ class CommandRegexTests(unittest.TestCase):
         self.assertIsNotNone(plugin_main._GAME_CMD_RE.match(f"{GAME} x"))
         # A command glued to another word must not match.
         self.assertIsNone(plugin_main._GAME_CMD_RE.match(f"{GAME}x"))
+
+
+class PlayerCommandRegexTests(unittest.TestCase):
+    """The two player count commands must behave like the existing ones."""
+
+    def test_player_regex_accepts_every_alias(self) -> None:
+        for name in plugin_main._PLAYERS_COMMANDS:
+            self.assertRegex(name, plugin_main._PLAYERS_CMD_RE)
+            self.assertRegex(f"/{name} {TERRARIA}", plugin_main._PLAYERS_CMD_RE)
+
+    def test_hot_regex_accepts_every_alias(self) -> None:
+        for name in plugin_main._HOT_COMMANDS:
+            self.assertRegex(name, plugin_main._HOT_CMD_RE)
+            self.assertRegex(f"/{name} 10", plugin_main._HOT_CMD_RE)
+
+    def test_player_regex_does_not_match_the_hot_command(self) -> None:
+        self.assertNotRegex(HOT, plugin_main._PLAYERS_CMD_RE)
+        self.assertNotRegex(HOT_FULL, plugin_main._PLAYERS_CMD_RE)
+
+    def test_hot_regex_does_not_match_the_player_command(self) -> None:
+        self.assertNotRegex(PLAYERS, plugin_main._HOT_CMD_RE)
+        self.assertNotRegex(PLAYERS_FULL, plugin_main._HOT_CMD_RE)
+
+    def test_player_regex_does_not_match_the_lookup_commands(self) -> None:
+        self.assertNotRegex(f"{GAME} {TERRARIA}", plugin_main._PLAYERS_CMD_RE)
+        self.assertNotRegex(DEALS, plugin_main._PLAYERS_CMD_RE)
+        self.assertNotRegex(f"{GAME} {TERRARIA}", plugin_main._HOT_CMD_RE)
+        self.assertNotRegex(DEALS, plugin_main._HOT_CMD_RE)
+
+    def test_lookup_regexes_do_not_match_the_player_commands(self) -> None:
+        self.assertNotRegex(PLAYERS, plugin_main._GAME_CMD_RE)
+        self.assertNotRegex(HOT, plugin_main._GAME_CMD_RE)
+        self.assertNotRegex(PLAYERS, plugin_main._DEALS_CMD_RE)
+        self.assertNotRegex(HOT, plugin_main._DEALS_CMD_RE)
+
+    def test_player_regex_is_anchored_and_bounded(self) -> None:
+        self.assertIsNotNone(plugin_main._PLAYERS_CMD_RE.match(PLAYERS))
+        self.assertIsNotNone(plugin_main._PLAYERS_CMD_RE.match(f"{PLAYERS} {TERRARIA}"))
+        self.assertIsNone(plugin_main._PLAYERS_CMD_RE.match(f"{PLAYERS}\u4eba"))
+        self.assertIsNone(plugin_main._PLAYERS_CMD_RE.match(f"{ASKING} {PLAYERS}"))
+
+    def test_hot_regex_is_anchored_and_bounded(self) -> None:
+        self.assertIsNotNone(plugin_main._HOT_CMD_RE.match(HOT))
+        self.assertIsNotNone(plugin_main._HOT_CMD_RE.match(f"{HOT} 5"))
+        # HOT_FULL is its own alias, so it matches; a bare suffix is not a
+        # command at all.
+        self.assertIsNotNone(plugin_main._HOT_CMD_RE.match(HOT_FULL))
+        self.assertIsNone(plugin_main._HOT_CMD_RE.match(f"{HOT}\u699c\u5355"))
+        self.assertIsNone(plugin_main._HOT_CMD_RE.match(f"{ASKING} {HOT}"))
+
+    def test_unrelated_text_matches_neither(self) -> None:
+        for text in (TERRARIA, "steam", f"\u4eca\u5929{PLAYERS}", f"\u7fa4\u53cb\u8bf4{HOT}\u4e86"):
+            self.assertNotRegex(text, plugin_main._PLAYERS_CMD_RE)
+            self.assertNotRegex(text, plugin_main._HOT_CMD_RE)
+
+    def test_both_commands_are_registered_as_regex_handlers(self) -> None:
+        # Same wake-prefix exemption the other two commands rely on.
+        for handler in ("steam_players_command", "steam_hot_command"):
+            decorators = _filter_decorators(_handler(handler))
+            self.assertIn("regex", decorators)
+            self.assertNotIn("command", decorators)
+
+    def test_player_handlers_take_only_self_and_event(self) -> None:
+        for handler in ("steam_players_command", "steam_hot_command"):
+            args = [a.arg for a in _handler(handler).args.args]
+            self.assertEqual(args, ["self", "event"])
+
+    def test_no_command_name_is_a_prefix_of_another_without_a_separator(self) -> None:
+        names = (
+            list(plugin_main._GAME_COMMANDS)
+            + list(plugin_main._DEALS_COMMANDS)
+            + list(plugin_main._PLAYERS_COMMANDS)
+            + list(plugin_main._HOT_COMMANDS)
+        )
+        # Longest first everywhere, so a shorter alias cannot shadow a longer
+        # one that starts with it.
+        for shorter, longer in zip(names, names[1:], strict=False):
+            if longer.startswith(shorter):
+                self.assertGreaterEqual(len(shorter), len(longer))
+        for name in names:
+            self.assertTrue(name.startswith("steam"), name)
+
+    def test_limit_arguments_are_stripped_for_both_commands(self) -> None:
+        self.assertEqual(plugin_main._strip_command(f"{HOT} 15", plugin_main._HOT_COMMANDS), "15")
+        self.assertEqual(
+            plugin_main._strip_command(f"{PLAYERS} {TERRARIA}", plugin_main._PLAYERS_COMMANDS),
+            TERRARIA,
+        )
+        self.assertEqual(
+            plugin_main._strip_command(PLAYERS_FULL, plugin_main._PLAYERS_COMMANDS), ""
+        )
 
 
 class StripCommandTests(unittest.TestCase):

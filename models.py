@@ -119,6 +119,33 @@ class DealItem:
         return f"https://store.steampowered.com/app/{self.appid}/"
 
 
+@dataclass(frozen=True)
+class PlayerCount:
+    """Live concurrent player figures for one app.
+
+    Attributes:
+        appid: Steam application id.
+        name: Localized display name.
+        players: Concurrent players right now, or None when unavailable.
+        peak_today: The peak figure Steam's most-played chart reports for this
+            game. Steam does not document the exact window and it can read
+            lower than ``players``, so it is shown as a separate labelled
+            figure and never as the live count.
+        rank: Position within the requested list, assigned after sorting.
+    """
+
+    appid: int
+    name: str
+    players: int | None = None
+    peak_today: int | None = None
+    rank: int = 0
+
+    @property
+    def store_url(self) -> str:
+        """Canonical Steam store URL for this appid."""
+        return f"https://store.steampowered.com/app/{self.appid}/"
+
+
 def to_decimal(value: object) -> Decimal | None:
     """Convert a loosely typed API value into a Decimal.
 

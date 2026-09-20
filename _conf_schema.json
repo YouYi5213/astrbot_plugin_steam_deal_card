@@ -24,5 +24,11 @@
     "description": "steam打折 默认显示的游戏数量。",
     "hint": "范围 1-20，数量越多渲染越慢。",
     "default": 10
+  },
+  "max_players": {
+    "type": "int",
+    "description": "steam热度 在线人数榜默认显示的游戏数量。",
+    "hint": "范围 1-50。实时人数需逐个游戏查询，数量越多耗时越长（20 个约 2 秒）。",
+    "default": 20
   }
 }
