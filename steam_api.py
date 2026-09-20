@@ -325,9 +325,20 @@ class SteamStoreClient:
         start = 0
         while len(rows) < wanted and start < 500:
             count = min(_MAX_PAGE_SIZE, max(wanted * 2, 50))
-            body = await self._request_specials_page(country, start, count, free_only)
+            body, host = await self._request_specials_page(country, start, count, free_only)
             page = _parse_specials_page(body.get("results_html") or "")
             if not page:
+                # A fallback host answering "nothing" is not evidence that
+                # nothing exists. Measured for giveaways: the global storefront
+                # reported 3 while the China storefront reported 0 with an empty
+                # body, because it does not carry them at all. Reporting "no
+                # giveaways" from that would be a silent false negative, so the
+                # answer is treated as unavailable instead.
+                if free_only and start == 0 and host != STEAM_SEARCH_BASES[0]:
+                    raise SteamApiError(
+                        "Steam 全球商店暂时不可达，而蒸汽平台不提供限时免费数据，"
+                        "因此无法确认现在有没有喜加一，请稍后再试。"
+                    )
                 break
             for row in page:
                 if row["appid"] in seen:
@@ -343,7 +354,7 @@ class SteamStoreClient:
         start: int,
         count: int,
         free_only: bool = False,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str]:
         """Request one page of the specials list, retrying until it answers.
 
         This host refuses connections intermittently rather than being blocked
@@ -357,7 +368,9 @@ class SteamStoreClient:
             free_only: Restrict the listing to base games at -100%.
 
         Returns:
-            The decoded response body.
+            The decoded response body and the host that answered it. The caller
+            needs the host because a fallback storefront carries a much smaller
+            catalogue, so its empty answer means something different.
 
         Raises:
             SteamApiError: If every attempt failed.
@@ -441,7 +454,11 @@ class SteamStoreClient:
         rows = await self.home_shelf("tab_upcoming_content", country)
         return rows[: max(limit, 1)]
 
-    async def _search_json(self, params: dict[str, Any], what: str) -> dict[str, Any]:
+    async def _search_json(
+        self,
+        params: dict[str, Any],
+        what: str,
+    ) -> tuple[dict[str, Any], str]:
         """Request a storefront search page, retrying hosts until one answers.
 
         Each host refuses connections intermittently rather than being blocked
@@ -455,7 +472,7 @@ class SteamStoreClient:
             what: Human readable name of the listing, used in errors.
 
         Returns:
-            The decoded response body.
+            The decoded response body and the host that produced it.
 
         Raises:
             SteamApiError: If every attempt on every host failed.
@@ -471,7 +488,7 @@ class SteamStoreClient:
                         timeout=_SPECIALS_ATTEMPT_TIMEOUT,
                     )
                     response.raise_for_status()
-                    return response.json()
+                    return response.json(), base
                 except Exception as exc:  # noqa: BLE001 - retried below
                     last_error = _describe_error(exc)
         raise SteamApiError(

@@ -426,6 +426,71 @@ class SpecialsRetryTests(unittest.TestCase):
         self.assertEqual(calls, [0, 50])
 
 
+class GiveawayFallbackTests(unittest.TestCase):
+    """A fallback storefront's empty answer is not proof that none exist."""
+
+    EMPTY = {"results_html": "", "total_count": 0}
+
+    def _client(self, global_fails: bool, china_payload: dict):
+        """Build a client that fails the global host and answers on China.
+
+        Args:
+            global_fails: Whether the global storefront raises.
+            china_payload: Body the China storefront returns.
+
+        Returns:
+            The client stub.
+        """
+
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                if "store.steampowered.com" in str(url):
+                    if global_fails:
+                        raise httpx.ConnectTimeout("")
+                    return _FakeResponse(SpecialsRetryTests.PAGE)
+                return _FakeResponse(china_payload)
+
+        return _Client()
+
+    def test_an_empty_fallback_answer_is_not_reported_as_none(self) -> None:
+        # Measured: the China storefront answers 200 with an empty body for the
+        # giveaway query while the global host reports three. Treating that as
+        # "no giveaways" produced a silent false negative for the user.
+        with self.assertRaises(SteamApiError) as ctx:
+            asyncio.run(
+                SteamStoreClient(self._client(True, self.EMPTY)).specials(
+                    "CN", limit=10, free_only=True
+                )
+            )
+        self.assertIn("\u65e0\u6cd5\u786e\u8ba4", str(ctx.exception))
+
+    def test_a_fallback_answer_with_rows_is_still_used(self) -> None:
+        # The fallback stays useful: if it does carry giveaways, use them.
+        rows = asyncio.run(
+            SteamStoreClient(self._client(True, SpecialsRetryTests.PAGE)).specials(
+                "CN", limit=10, free_only=True
+            )
+        )
+        self.assertEqual(len(rows), 1)
+
+    def test_the_ordinary_deals_list_still_accepts_an_empty_fallback(self) -> None:
+        # Only the giveaway query is catalogue-sensitive in this way; a genuinely
+        # empty specials list must still report "none" rather than an error.
+        rows = asyncio.run(
+            SteamStoreClient(self._client(True, self.EMPTY)).specials("CN", limit=10)
+        )
+        self.assertEqual(rows, [])
+
+    def test_an_empty_primary_answer_is_reported_as_none(self) -> None:
+        # When the authoritative host itself says zero, that is real evidence.
+        class _Client:
+            async def get(self, url, params=None, **kwargs):
+                return _FakeResponse(GiveawayFallbackTests.EMPTY)
+
+        rows = asyncio.run(SteamStoreClient(_Client()).specials("CN", limit=10, free_only=True))
+        self.assertEqual(rows, [])
+
+
 class PlayerCountApiTests(unittest.TestCase):
     """The two player-count endpoints, including their failover behaviour."""
 
