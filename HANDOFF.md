@@ -30,12 +30,18 @@
 steam游戏 <游戏名|appid|Steam链接>     查当前价/史低/评价/封面
 steam游戏 <序号>                       从候选列表里选
 steam打折 [数量]                       当前促销列表
+steam免费 [数量]                       限时免费领取（喜加一）
 steam在线 <游戏名|appid>               单个游戏实时在线人数
 steam热度 [数量]                       在线人数榜（按实时人数降序）
+steam即将推出 [数量]                   Steam 首页「热门即将推出」货架
 ```
 
 别名：`steam游戏查询`/`steam查价`/`steam价格`；`steam特惠`/`steam促销`/`steam优惠`；
-`steam在线人数`/`steam人数`；`steam热度榜`/`steam排行`/`steam在线榜`。
+`steam限免`/`steam喜加一`/`steam限时免费`；`steam在线人数`/`steam人数`；
+`steam热度榜`/`steam排行`/`steam在线榜`；`steam即将发售`/`steam预售`/`steam未发售`。
+
+加新命令时记得同步 `tests/test_command_binding.py`：那里用 AST 锁住了
+「有几个 handler 发图」和「哪些 handler 用了 `_image_result`」，数量不对会红。
 
 ## 必须知道的坑（都踩过，别再踩）
 

@@ -325,6 +325,93 @@ class ParseSpecialsPageTests(unittest.TestCase):
         self.assertEqual(_parse_specials_page(""), [])
 
 
+class GiveawayPriceTests(unittest.TestCase):
+    """A -100% giveaway is not a discount and must not be read as one."""
+
+    # Shaped after a real response: active_discounts is absent, the deadline
+    # lives in free_to_keep_ends, and the price reads as a literal zero.
+    GIVEAWAY = {
+        "best_purchase_option": {
+            "formatted_final_price": "\u00a50.00",
+            "formatted_original_price": "\u00a522.00",
+            "final_price_in_cents": "0",
+            "original_price_in_cents": "2200",
+            "discount_pct": 100,
+            "is_free_to_keep": True,
+            "free_to_keep_ends": 1790182800,
+        }
+    }
+
+    def test_flags_the_item_as_a_giveaway(self) -> None:
+        price = parse_price(self.GIVEAWAY)
+        self.assertIsNotNone(price)
+        self.assertTrue(price.is_giveaway)
+        self.assertEqual(price.discount_percent, 100)
+
+    def test_reads_the_deadline_from_free_to_keep_ends(self) -> None:
+        # Reading only active_discounts leaves this None, and the deadline is
+        # the whole point of the feature.
+        price = parse_price(self.GIVEAWAY)
+        self.assertEqual(price.discount_end, datetime.fromtimestamp(1790182800, tz=timezone.utc))
+
+    def test_an_ordinary_discount_is_not_a_giveaway(self) -> None:
+        price = parse_price(
+            {
+                "best_purchase_option": {
+                    "formatted_final_price": "\u00a529.80",
+                    "formatted_original_price": "\u00a5298.00",
+                    "discount_pct": 90,
+                    "active_discounts": [{"discount_end_date": 1790874000}],
+                }
+            }
+        )
+        self.assertFalse(price.is_giveaway)
+        self.assertEqual(price.discount_end, datetime.fromtimestamp(1790874000, tz=timezone.utc))
+
+    def test_a_giveaway_without_a_deadline_still_parses(self) -> None:
+        payload = {
+            "best_purchase_option": {
+                "formatted_final_price": "\u00a50.00",
+                "discount_pct": 100,
+                "is_free_to_keep": True,
+            }
+        }
+        price = parse_price(payload)
+        self.assertTrue(price.is_giveaway)
+        self.assertIsNone(price.discount_end)
+
+    def test_a_free_to_play_game_is_not_a_giveaway(self) -> None:
+        # Free-to-play has no purchase option at all; it must not be labelled
+        # as a limited-time giveaway.
+        self.assertIsNone(parse_price({"best_purchase_option": {}}))
+
+
+class FormatEndTests(unittest.TestCase):
+    """The end-date wording must match the mechanism it describes."""
+
+    NOW = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
+
+    def test_giveaway_says_claim_by_not_discount(self) -> None:
+        end = datetime(2026, 9, 22, 6, 59, tzinfo=timezone.utc)
+        text = render_mod._format_end(end, self.NOW, compact=True, giveaway=True)
+        self.assertIn("\u9886\u53d6\u622a\u6b62", text)
+        self.assertNotIn("\u6298\u6263", text)
+
+    def test_ordinary_discount_keeps_the_discount_wording(self) -> None:
+        end = datetime(2026, 9, 22, 6, 59, tzinfo=timezone.utc)
+        text = render_mod._format_end(end, self.NOW, compact=True)
+        self.assertIn("\u6298\u6263", text)
+        self.assertNotIn("\u9886\u53d6", text)
+
+    def test_a_passed_giveaway_deadline_is_reported(self) -> None:
+        end = datetime(2026, 9, 19, 6, 59, tzinfo=timezone.utc)
+        text = render_mod._format_end(end, self.NOW, compact=True, giveaway=True)
+        self.assertIn("\u5df2\u7ed3\u675f", text)
+
+    def test_no_end_time_means_no_text(self) -> None:
+        self.assertEqual(render_mod._format_end(None, self.NOW, compact=True, giveaway=True), "")
+
+
 class ParsePriceTests(unittest.TestCase):
     def test_parses_a_discounted_price(self) -> None:
         price = parse_price(

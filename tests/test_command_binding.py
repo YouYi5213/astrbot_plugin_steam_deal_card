@@ -232,8 +232,8 @@ class ImageDeliveryTests(unittest.TestCase):
             and node.func.id == "_image_result"
         ]
         # deals, game card, candidate list, single player count, ranking,
-        # upcoming.
-        self.assertEqual(len(calls), 6)
+        # upcoming, giveaways.
+        self.assertEqual(len(calls), 7)
 
     def test_every_image_sending_handler_uses_the_helper(self) -> None:
         senders = [
@@ -252,6 +252,7 @@ class ImageDeliveryTests(unittest.TestCase):
             sorted(
                 [
                     "steam_deals_command",
+                    "steam_free_command",
                     "steam_players_command",
                     "steam_hot_command",
                     "steam_upcoming_command",
@@ -516,6 +517,49 @@ class CommandRegistrationTests(unittest.TestCase):
             ),
             "5",
         )
+
+    def test_free_command_is_registered(self) -> None:
+        self.assertIn("steam免费", plugin_main._FREE_COMMANDS)
+        self.assertIn("steam限免", plugin_main._FREE_COMMANDS)
+        self.assertTrue(plugin_main._FREE_CMD_RE.match("steam免费"))
+        self.assertTrue(plugin_main._FREE_CMD_RE.match("steam限免"))
+        self.assertTrue(plugin_main._FREE_CMD_RE.match("/steam免费"))
+
+    def test_free_command_does_not_capture_other_commands(self) -> None:
+        # The free command must not swallow the discount listing or vice versa.
+        self.assertIsNone(plugin_main._FREE_CMD_RE.match("steam打折"))
+        self.assertIsNone(plugin_main._DEALS_CMD_RE.match("steam免费"))
+        self.assertIsNone(plugin_main._GAME_CMD_RE.match("steam免费"))
+
+    def test_the_longest_free_alias_wins(self) -> None:
+        # "steam限时免费" must be matched whole, not truncated to a shorter alias.
+        self.assertTrue(plugin_main._FREE_CMD_RE.match("steam限时免费"))
+        self.assertEqual(
+            plugin_main._strip_command("steam限时免费", plugin_main._FREE_COMMANDS), ""
+        )
+
+    def test_free_command_accepts_a_count_argument(self) -> None:
+        self.assertEqual(plugin_main._strip_command("steam免费 5", plugin_main._FREE_COMMANDS), "5")
+
+    def test_the_free_handler_wires_the_giveaway_calls(self) -> None:
+        # The handler is a method on the plugin class, so walk the AST rather
+        # than look for a module attribute.
+        handler = next(
+            (
+                node
+                for node in ast.walk(_MODULE)
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "steam_free_command"
+            ),
+            None,
+        )
+        self.assertIsNotNone(handler)
+        called = {
+            node.func.attr
+            for node in ast.walk(handler)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("free_games", called)
+        self.assertIn("render_free", called)
 
 
 class StoreLinkDeliveryTests(unittest.TestCase):

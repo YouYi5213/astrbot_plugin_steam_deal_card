@@ -53,6 +53,7 @@ class PriceInfo:
     current_value: Decimal | None = None
     original_value: Decimal | None = None
     discount_end: datetime | None = None
+    is_giveaway: bool = False
 
     @property
     def is_discounted(self) -> bool:

@@ -14,6 +14,7 @@ from .name_match import is_confident, rank_candidates
 from .render import (
     render_candidates,
     render_deals_card,
+    render_free_card,
     render_game_card,
     render_players_card,
     render_ranking_card,
@@ -331,12 +332,46 @@ class SteamDealService:
             raise LookupError("暂时没有获取到 Steam 即将推出的游戏。")
         return await self._enrich_rows(rows, "暂时没有获取到 Steam 即将推出的游戏。")
 
-    async def _enrich_rows(self, rows: list[dict], empty_message: str) -> list[DealItem]:
+    async def free_games(self, limit: int | None = None) -> list[DealItem]:
+        """Fetch the games currently free to keep for a limited time.
+
+        Unlike the ordinary deals list, the deadline is the whole point here:
+        once the promotion ends the game is gone from the account forever, so
+        the end date is kept rather than stripped.
+
+        Args:
+            limit: Override for the number of games to return.
+
+        Returns:
+            The giveaways, in the storefront's own order.
+
+        Raises:
+            LookupError: If the listing cannot be fetched or every row fails.
+        """
+        wanted = max(limit or self.max_deals, 1)
+        rows = await self.store.specials(self.country, limit=wanted, free_only=True)
+        if not rows:
+            raise LookupError("暂时没有可以免费领取的游戏。")
+        return await self._enrich_rows(
+            rows,
+            "暂时没有可以免费领取的游戏。",
+            keep_free_deadline=True,
+        )
+
+    async def _enrich_rows(
+        self,
+        rows: list[dict],
+        empty_message: str,
+        keep_free_deadline: bool = False,
+    ) -> list[DealItem]:
         """Attach store details and lowest prices to listing rows.
 
         Args:
             rows: Raw listing rows.
             empty_message: Error text when every row fails to build.
+            keep_free_deadline: Keep the discount end date on free entries. It is
+                dropped for ordinary free games, where the date means nothing,
+                but for a giveaway it is the deadline to claim by.
 
         Returns:
             The built items, rows that cannot be built being skipped.
@@ -362,10 +397,14 @@ class SteamDealService:
             )
             if item is None:
                 continue
-            # A free game has no meaningful historical low, and Heybox would
-            # otherwise report a figure for a paid edition of the same title.
-            if item.price.formatted_current == _FREE_LABEL:
-                item = replace(item, lowest=None, price=replace(item.price, discount_end=None))
+            # Neither a free-to-play game nor a giveaway has a meaningful
+            # historical low, and Heybox would otherwise report a figure for a
+            # paid edition of the same title. A giveaway is recognised by its
+            # own flag: it reads as "¥0.00" rather than the free-to-play label.
+            if item.price.is_giveaway or item.price.formatted_current == _FREE_LABEL:
+                item = replace(item, lowest=None)
+                if not keep_free_deadline:
+                    item = replace(item, price=replace(item.price, discount_end=None))
             built.append(item)
         if not built:
             raise LookupError(empty_message)
@@ -569,6 +608,21 @@ class SteamDealService:
             deal.appid: data for deal, data in zip(deals, images, strict=True) if data is not None
         }
         return await asyncio.to_thread(render_deals_card, deals, capsules)
+
+    async def render_free(self, deals: list[DealItem]) -> bytes:
+        """Render the giveaway card, downloading all capsule images in parallel.
+
+        Args:
+            deals: Giveaways to render.
+
+        Returns:
+            PNG image bytes.
+        """
+        images = await asyncio.gather(*[self._download_first(deal.capsule_urls) for deal in deals])
+        capsules = {
+            deal.appid: data for deal, data in zip(deals, images, strict=True) if data is not None
+        }
+        return await asyncio.to_thread(render_free_card, deals, capsules)
 
     async def render_ranking(
         self,

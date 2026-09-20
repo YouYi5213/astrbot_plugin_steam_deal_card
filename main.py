@@ -18,7 +18,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.4.6"
+PLUGIN_VERSION = "1.5.0"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -41,6 +41,8 @@ _DEALS_COMMANDS = ("steam打折", "steam特惠", "steam促销", "steam优惠")
 _PLAYERS_COMMANDS = ("steam在线人数", "steam在线", "steam人数")
 _HOT_COMMANDS = ("steam热度榜", "steam热度", "steam排行", "steam在线榜")
 _UPCOMING_COMMANDS = ("steam即将推出", "steam即将发售", "steam预售", "steam未发售")
+# Limited-time giveaways. Longer names first so "steam限时免费" is matched whole.
+_FREE_COMMANDS = ("steam限时免费", "steam喜加一", "steam免费", "steam限免")
 
 # Longest names first so "steam游戏查询" is not shadowed by "steam游戏".
 _GAME_CMD_RE = re.compile(
@@ -57,6 +59,9 @@ _HOT_CMD_RE = re.compile(
 )
 _UPCOMING_CMD_RE = re.compile(
     r"^/?(?:" + "|".join(re.escape(name) for name in _UPCOMING_COMMANDS) + r")(?:\s|$)"
+)
+_FREE_CMD_RE = re.compile(
+    r"^/?(?:" + "|".join(re.escape(name) for name in _FREE_COMMANDS) + r")(?:\s|$)"
 )
 
 
@@ -258,6 +263,31 @@ class SteamDealCardPlugin(Star):
         except Exception as exc:  # noqa: BLE001 - reported to the user
             logger.exception("Steam deals lookup failed")
             yield event.plain_result(f"获取折扣失败：{exc}")
+            return
+
+        yield _image_result(event, image)
+
+    @filter.regex(_FREE_CMD_RE, priority=10)
+    async def steam_free_command(self, event: AstrMessageEvent):
+        """Handle the limited-time giveaway command.
+
+        Args:
+            event: The incoming message event.
+
+        Yields:
+            Text or image results.
+        """
+        text = _strip_command(event.get_message_str(), _FREE_COMMANDS)
+        try:
+            wanted = int(text) if text.isdigit() and int(text) > 0 else None
+            deals = await self.service.free_games(wanted)
+            image = await self.service.render_free(deals)
+        except LookupError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - reported to the user
+            logger.exception("Steam giveaway lookup failed")
+            yield event.plain_result(f"获取限时免费失败：{exc}")
             return
 
         yield _image_result(event, image)

@@ -529,6 +529,7 @@ def _format_end(
     discount_end: datetime | None,
     now: datetime | None = None,
     compact: bool = False,
+    giveaway: bool = False,
 ) -> str:
     """Describe when a discount ends, including days remaining.
 
@@ -537,6 +538,9 @@ def _format_end(
         now: Reference time, defaulting to the current UTC time.
         compact: Drop the year when it matches the reference year, which keeps
             the text short enough for the dense deals list.
+        giveaway: The end time is a claim-by deadline rather than a price rise,
+            so the wording says so. Missing a giveaway means losing the game,
+            not paying more.
 
     Returns:
         A display string, or an empty string when there is no end time.
@@ -550,9 +554,11 @@ def _format_end(
     else:
         stamp = discount_end.strftime("%Y-%m-%d")
     if remaining < 0:
-        return f"折扣已结束（{stamp}）"
+        return f"{'领取' if giveaway else '折扣'}已结束（{stamp}）"
     if remaining == 0:
-        return f"折扣今天结束（{stamp}）"
+        return f"{'领取今天截止' if giveaway else '折扣今天结束'}（{stamp}）"
+    if giveaway:
+        return f"领取截止 {stamp}（剩 {remaining} 天）"
     return f"折扣 {stamp} 结束（剩 {remaining} 天）"
 
 
@@ -717,6 +723,35 @@ def render_deals_card(
     )
 
 
+def render_free_card(
+    deals: list[DealItem],
+    capsules: dict[int, bytes] | None = None,
+    title: str = "Steam 限时免费领取",
+    now: datetime | None = None,
+) -> bytes:
+    """Render the games currently free to keep for a limited time.
+
+    Args:
+        deals: Giveaways to render.
+        capsules: Mapping of appid to raw capsule image bytes.
+        title: Heading shown at the top of the card.
+        now: Reference time for remaining-day calculations.
+
+    Returns:
+        PNG image bytes.
+    """
+    return render_ranking_card(
+        deals,
+        capsules=capsules,
+        title=title,
+        subtitle=f"共 {len(deals)} 款可免费入库 · 领取后永久保留",
+        now=now,
+        show_lowest=False,
+        show_discount=True,
+        show_end=True,
+    )
+
+
 def render_ranking_card(
     items: list[DealItem],
     capsules: dict[int, bytes] | None = None,
@@ -791,6 +826,11 @@ def render_ranking_card(
         # long game names use every remaining pixel instead of a guessed budget.
         price_font = _font(32)
         price_text = deal.price.formatted_current
+        if deal.price.is_giveaway:
+            # Steam reports "¥0.00", which reads as a broken price rather than a
+            # gift. The number worth showing is what it is free *from*, which
+            # goes in the bottom row.
+            price_text = "免费"
         price_w = _text_width(draw, price_text, price_font)
         badge_font = _font(20)
         badge_text = (
@@ -821,6 +861,17 @@ def render_ranking_card(
 
         # The bottom row carries whichever context lines apply to this listing.
         bottom_x = text_x
+        if deal.price.is_giveaway and deal.price.formatted_original:
+            # "免费" alone loses the fact that this is normally a paid game.
+            original_text = f"原价 {deal.price.formatted_original}"
+            draw.text(
+                (bottom_x, top + 84),
+                _truncate(draw, original_text, info_font, name_width),
+                font=info_font,
+                fill=TEXT_DIM,
+            )
+            bottom_x += _text_width(draw, original_text, info_font) + 24
+
         if show_lowest:
             lowest_text = (
                 f"史低 {_money(deal.lowest.value, deal.lowest.currency)}"
@@ -852,7 +903,12 @@ def render_ranking_card(
         if show_end:
             # Share the bottom row, giving it whatever width is left rather
             # than a fixed budget that truncates it.
-            end_text = _format_end(deal.price.discount_end, now, compact=True)
+            end_text = _format_end(
+                deal.price.discount_end,
+                now,
+                compact=True,
+                giveaway=deal.price.is_giveaway,
+            )
             if end_text:
                 end_right = CARD_WIDTH - PADDING - 10
                 if end_right - bottom_x > 80:

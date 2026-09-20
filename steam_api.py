@@ -64,6 +64,10 @@ HEYBOX_WEB_BASE = "https://www.xiaoheihe.cn"
 
 # Steam caps the infinite-scroll endpoint at 100 rows per request.
 _MAX_PAGE_SIZE = 100
+# Steam's storefront "Games" category. The search endpoint otherwise mixes DLC
+# into a filtered listing: a sampled giveaway page held three games plus one
+# weapon pack, and this category dropped exactly the pack.
+_BASE_GAMES_CATEGORY = 998
 # Keep a single GetItems call within a size the endpoint answers quickly.
 _GET_ITEMS_CHUNK = 50
 # Budget for the first request to a not-yet-confirmed API host. The endpoint
@@ -292,12 +296,22 @@ class SteamStoreClient:
             )
         return rows[: max(limit, 1)]
 
-    async def specials(self, country: str = "CN", limit: int = 20) -> list[dict[str, Any]]:
+    async def specials(
+        self,
+        country: str = "CN",
+        limit: int = 20,
+        free_only: bool = False,
+    ) -> list[dict[str, Any]]:
         """Fetch the current Steam specials list.
 
         Args:
             country: Steam storefront country code.
             limit: Maximum number of discounted entries to return.
+            free_only: Keep only limited-time giveaways, i.e. paid games
+                currently at -100%. Measured behaviour: with ``specials=1`` and
+                ``maxprice=free`` every row is a true giveaway (4 of 4 sampled
+                had a non-zero original price and ``-100%``), but the list also
+                includes DLC, so ``category1`` is pinned to base games.
 
         Returns:
             Raw row dicts with appid, name, capsule and price text.
@@ -311,7 +325,7 @@ class SteamStoreClient:
         start = 0
         while len(rows) < wanted and start < 500:
             count = min(_MAX_PAGE_SIZE, max(wanted * 2, 50))
-            body = await self._request_specials_page(country, start, count)
+            body = await self._request_specials_page(country, start, count, free_only)
             page = _parse_specials_page(body.get("results_html") or "")
             if not page:
                 break
@@ -328,6 +342,7 @@ class SteamStoreClient:
         country: str,
         start: int,
         count: int,
+        free_only: bool = False,
     ) -> dict[str, Any]:
         """Request one page of the specials list, retrying until it answers.
 
@@ -339,6 +354,7 @@ class SteamStoreClient:
             country: Steam storefront country code.
             start: Pagination offset.
             count: Rows to request.
+            free_only: Restrict the listing to base games at -100%.
 
         Returns:
             The decoded response body.
@@ -355,6 +371,11 @@ class SteamStoreClient:
             "cc": country,
             "l": self.language,
         }
+        if free_only:
+            params["maxprice"] = "free"
+            # Without this the list mixes in DLC: a sampled page held three
+            # games plus one weapon pack, and 998 dropped exactly the pack.
+            params["category1"] = _BASE_GAMES_CATEGORY
         return await self._search_json(params, "Steam 特惠列表")
 
     async def home_shelf(self, anchor: str, country: str = "CN") -> list[dict[str, Any]]:
@@ -457,36 +478,6 @@ class SteamStoreClient:
             f"{what}请求失败：{last_error}"
             f"（已在 {len(STEAM_SEARCH_BASES)} 个站点各重试 {_SPECIALS_ATTEMPTS} 次）"
         )
-
-    async def _request_specials_page(
-        self,
-        country: str,
-        start: int,
-        count: int,
-    ) -> dict[str, Any]:
-        """Request one page of the specials list.
-
-        Args:
-            country: Steam storefront country code.
-            start: Pagination offset.
-            count: Rows to request.
-
-        Returns:
-            The decoded response body.
-
-        Raises:
-            SteamApiError: If every attempt failed.
-        """
-        params = {
-            "query": "",
-            "start": start,
-            "count": count,
-            "specials": 1,
-            "infinite": 1,
-            "cc": country,
-            "l": self.language,
-        }
-        return await self._search_json(params, "Steam 特惠列表")
 
 
 class HeyboxClient:
@@ -905,13 +896,21 @@ def parse_price(item: dict[str, Any]) -> PriceInfo | None:
         return None
     original_text = str(option.get("formatted_original_price") or "").strip()
     discount = int(option.get("discount_pct") or 0)
+    # A limited-time giveaway is a separate mechanism from a discount: it flags
+    # itself with ``is_free_to_keep`` and carries its deadline in
+    # ``free_to_keep_ends``, while ``active_discounts`` is empty. Reading only
+    # the discount field would leave the deadline blank, which for a giveaway is
+    # the single most important number on the card.
+    giveaway = bool(option.get("is_free_to_keep"))
     return PriceInfo(
         formatted_current=current_text,
         formatted_original=original_text or current_text,
         discount_percent=discount,
         current_value=_cents_to_decimal(option.get("final_price_in_cents")),
         original_value=_cents_to_decimal(option.get("original_price_in_cents")),
-        discount_end=_parse_discount_end(option.get("active_discounts")),
+        discount_end=_parse_discount_end(option.get("active_discounts"))
+        or (_parse_timestamp(option.get("free_to_keep_ends")) if giveaway else None),
+        is_giveaway=giveaway,
     )
 
 
@@ -1109,6 +1108,24 @@ def _parse_discount_end(active_discounts: Any) -> datetime | None:
     if not stamps:
         return None
     return datetime.fromtimestamp(min(stamps), tz=timezone.utc)
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Convert a Unix timestamp into an aware UTC datetime.
+
+    Args:
+        value: Seconds since the epoch, as a number or numeric string.
+
+    Returns:
+        The datetime in UTC, or None when the value is unusable.
+    """
+    stamp = to_decimal(value)
+    if stamp is None or stamp <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(float(stamp), tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _format_release_date(value: Any) -> str:
