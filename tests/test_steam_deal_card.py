@@ -110,6 +110,11 @@ WITCHER3_CN = "\u5deb\u5e083\uff1a\u72c2\u730e"  # 巫师3：狂猎
 WITCHER3_DLC = "\u5deb\u5e083\uff1a\u72c2\u730e - \u8840\u4e0e\u9152"  # 巫师3：狂猎 - 血与酒
 ZELDA_CN = "\u585e\u5c14\u8fbe"  # 塞尔达
 AVATAR_CN = "\u963f\u51e1\u8fbe\uff1a\u6f58\u591a\u62c9\u8fb9\u5883"  # 阿凡达：潘多拉边境
+RDR2_CN = "\u8352\u91ce\u5927\u9556\u5ba22"  # 荒野大镖客2
+RDR2_FULL = "\u8352\u91ce\u5927\u9556\u5ba2\uff1a\u6551\u8d4e2"  # 荒野大镖客：救赎2
+RDR2_ONLINE = (
+    "\u8352\u91ce\u5927\u9556\u5ba2 \u7ebf\u4e0a\u6a21\u5f0f Steam\u7248"  # 荒野大镖客 线上模式
+)
 FREE_GAME_CN = "\u514d\u8d39\u6e38\u620f"  # 免费游戏
 LONG_NAME_CN = "\u8fd9\u662f\u4e00\u4e2a\u6781\u5176\u5197\u957f\u7684\u6e38\u620f\u540d\u79f0"
 GAME_CN = "\u6e38\u620f"  # 游戏
@@ -164,6 +169,38 @@ class ScoreCandidateTests(unittest.TestCase):
 
     def test_empty_query_scores_zero(self) -> None:
         self.assertEqual(score_candidate("", "Terraria"), 0.0)
+
+    def test_a_title_that_inserts_characters_mid_name_still_matches(self) -> None:
+        # 荒野大镖客2 is how people ask for 荒野大镖客：救赎2. CJK has no word
+        # boundaries, so no prefix or substring test can bridge the inserted
+        # 救赎, and the correct appid used to be scored 0 and discarded.
+        self.assertEqual(score_candidate(RDR2_CN, RDR2_FULL), 60.0)
+
+    def test_the_subsequence_tier_ranks_below_a_prefix_match(self) -> None:
+        gapped = score_candidate(RDR2_CN, RDR2_FULL)
+        prefix = score_candidate(SEKIRO_CN, SEKIRO_FULL)
+        self.assertLess(gapped, prefix)
+
+    def test_a_gapped_match_needs_enough_coverage(self) -> None:
+        # The query must account for most of the title, or every short CJK
+        # query would match something long and unrelated.
+        self.assertEqual(score_candidate(RDR2_CN, RDR2_ONLINE), 0.0)
+
+    def test_a_short_query_does_not_gap_match(self) -> None:
+        # 幻塔 must not match unrelated titles that merely contain 塔.
+        self.assertEqual(score_candidate("\u5e7b\u5854", "\u7c73\u5854"), 0.0)
+        self.assertEqual(
+            score_candidate("\u5e7b\u5854", "Fantasy Grounds - The Tower of Jhedophar"),
+            0.0,
+        )
+
+    def test_latin_subsequences_do_not_match(self) -> None:
+        # "gtav" is a subsequence of "grandtheftautov" but is not a match.
+        self.assertEqual(score_candidate("gtav", "Grand Theft Auto V"), 0.0)
+
+    def test_a_shorter_title_inside_a_longer_query_also_matches(self) -> None:
+        # The gapped tier works in both directions.
+        self.assertEqual(score_candidate(RDR2_FULL, RDR2_CN), 60.0)
 
 
 class RankCandidatesTests(unittest.TestCase):

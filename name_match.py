@@ -9,12 +9,60 @@ from .models import GameCandidate
 _CJK = r"\u3400-\u9fff"
 _NON_WORD = re.compile(rf"[^0-9a-z{_CJK}]+")
 _WORD_SPLIT = re.compile(rf"[^0-9a-z{_CJK}]+")
+_CJK_CHAR = re.compile(rf"[{_CJK}]")
 
 # Scores assigned to each kind of name match.
 _EXACT = 100.0
 _PREFIX = 85.0
 _CONTAINS = 70.0
+_SUBSEQUENCE = 60.0
 _TOKEN_BASE = 40.0
+
+# Guards for the subsequence tier. CJK is written without spaces, so a query
+# and the store's title for the same game can differ by characters inserted in
+# the middle, which no prefix or substring test can bridge: ``荒野大镖客2`` is
+# the natural way to ask for ``荒野大镖客：救赎2``. Subsequence matching covers
+# that, but it is loose by nature, so it needs both a length floor and a
+# coverage floor, and it only applies when the shorter side contains CJK.
+_MIN_SUBSEQUENCE_LEN = 3
+_MIN_SUBSEQUENCE_RATIO = 0.5
+
+
+def _is_subsequence(shorter: str, longer: str) -> bool:
+    """Report whether ``shorter`` appears in ``longer`` in order, gaps allowed.
+
+    Args:
+        shorter: The string that must be consumed.
+        longer: The string to consume it from.
+
+    Returns:
+        True when every character of ``shorter`` occurs in ``longer`` in order.
+    """
+    remaining = iter(longer)
+    return all(char in remaining for char in shorter)
+
+
+def _subsequence_score(key: str, target: str) -> float:
+    """Score a gapped in-order match, or zero when it does not qualify.
+
+    Args:
+        key: Normalized query.
+        target: Normalized candidate name.
+
+    Returns:
+        :data:`_SUBSEQUENCE` when the shorter side is a CJK-bearing
+        subsequence covering enough of the longer side, otherwise 0.
+    """
+    shorter, longer = (key, target) if len(key) <= len(target) else (target, key)
+    if len(shorter) < _MIN_SUBSEQUENCE_LEN or not longer:
+        return 0.0
+    # Latin-only subsequences match far too much (``gtav`` inside ``grand theft
+    # auto v``), and the problem this solves is specific to CJK.
+    if not _CJK_CHAR.search(shorter):
+        return 0.0
+    if len(shorter) / len(longer) < _MIN_SUBSEQUENCE_RATIO:
+        return 0.0
+    return _SUBSEQUENCE if _is_subsequence(shorter, longer) else 0.0
 
 
 def normalize(text: str) -> str:
@@ -75,6 +123,11 @@ def score_candidate(query: str, *names: str) -> float:
             continue
         if key in target:
             best = max(best, _CONTAINS)
+            continue
+        # Gapped in-order match, for titles that insert characters mid-name.
+        subsequence = _subsequence_score(key, target)
+        if subsequence:
+            best = max(best, subsequence)
             continue
         target_tokens = tokenize(name)
         if query_tokens and target_tokens:
