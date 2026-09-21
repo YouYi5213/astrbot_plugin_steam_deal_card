@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1177,6 +1179,175 @@ def _service(store: _StubStore) -> SteamDealService:
         history_country="cn",
         max_players=20,
     )
+
+
+class _StubGiveawayStore:
+    """Store stub that serves giveaways or fails, for the cache tests."""
+
+    def __init__(self, rows: list[dict] | None, fail: bool = False) -> None:
+        self._rows = rows or []
+        self._fail = fail
+        self.items: dict[int, dict] = {}
+
+    async def specials(self, country="CN", limit=20, free_only=False):  # noqa: ANN001, ANN201
+        if self._fail:
+            raise SteamApiError("Steam 全球商店暂时不可达")
+        return self._rows[:limit]
+
+    async def get_items(self, appids, country):  # noqa: ANN001, ANN201
+        return {appid: self.items[appid] for appid in appids if appid in self.items}
+
+    async def lowest_price(self, appid):  # noqa: ANN001, ANN201
+        return None
+
+
+def _giveaway_row(appid: int, name: str, end: int) -> dict:
+    return {
+        "appid": appid,
+        "name": name,
+        "discount": 100,
+        "final": "\u00a50.00",
+        "original": "\u00a522.00",
+        "capsule": f"https://cdn/{appid}.jpg",
+        "end": end,
+    }
+
+
+def _giveaway_item(end: int) -> dict:
+    return {
+        "best_purchase_option": {
+            "formatted_final_price": "\u00a50.00",
+            "formatted_original_price": "\u00a522.00",
+            "discount_pct": 100,
+            "is_free_to_keep": True,
+            "free_to_keep_ends": end,
+        }
+    }
+
+
+class FreeGameCacheTests(unittest.TestCase):
+    """The global storefront blips, so the last good giveaway list is reused."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name) / "free_games_cache.json"
+        self.addCleanup(self._tmp.cleanup)
+
+    def _service(self, store) -> SteamDealService:  # noqa: ANN001
+        return SteamDealService(
+            store=store,  # type: ignore[arg-type]
+            heybox=_StubHeybox(),  # type: ignore[arg-type]
+            http=None,  # type: ignore[arg-type]
+            country="CN",
+            history_country="cn",
+            free_cache_path=self.cache,
+        )
+
+    def test_a_successful_fetch_writes_the_cache(self) -> None:
+        future = int(datetime.now(timezone.utc).timestamp()) + 86400
+        store = _StubGiveawayStore([_giveaway_row(1, "Deadshot", future)])
+        store.items[1] = _giveaway_item(future)
+        asyncio.run(self._service(store).free_games())
+        self.assertTrue(self.cache.exists())
+        payload = json.loads(self.cache.read_text(encoding="utf-8"))
+        self.assertEqual(payload["items"][0]["appid"], 1)
+
+    def test_the_cache_is_served_when_the_store_fails(self) -> None:
+        future = int(datetime.now(timezone.utc).timestamp()) + 86400
+        good = _StubGiveawayStore([_giveaway_row(1, "Deadshot", future)])
+        good.items[1] = _giveaway_item(future)
+        asyncio.run(self._service(good).free_games())
+
+        down = self._service(_StubGiveawayStore(None, fail=True))
+        deals = asyncio.run(down.free_games())
+        self.assertEqual([d.appid for d in deals], [1])
+        # The reuse must be declared, not passed off as a fresh answer.
+        self.assertIn("\u7f13\u5b58", down.free_cache_note)
+        self.assertIn("\u53ef\u80fd\u4e0d\u662f\u6700\u65b0", down.free_cache_note)
+
+    def test_a_fresh_fetch_clears_the_cache_note(self) -> None:
+        future = int(datetime.now(timezone.utc).timestamp()) + 86400
+        store = _StubGiveawayStore([_giveaway_row(1, "Deadshot", future)])
+        store.items[1] = _giveaway_item(future)
+        service = self._service(store)
+        service.free_cache_note = "stale"
+        asyncio.run(service.free_games())
+        self.assertEqual(service.free_cache_note, "")
+
+    def test_expired_entries_are_dropped_from_the_cache(self) -> None:
+        # A deadline that has passed is useless: the game can no longer be
+        # claimed, so showing it would send the user on a wasted trip.
+        past = int(datetime.now(timezone.utc).timestamp()) - 60
+        self.cache.write_text(
+            json.dumps(
+                {
+                    "fetched_at": past,
+                    "items": [
+                        {
+                            "appid": 1,
+                            "name": "Gone",
+                            "capsules": [],
+                            "current": "\u00a50.00",
+                            "original": "\u00a522.00",
+                            "percent": 100,
+                            "end": past,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        service = self._service(_StubGiveawayStore(None, fail=True))
+        with self.assertRaises(SteamApiError):
+            asyncio.run(service.free_games())
+
+    def test_a_future_entry_survives_the_expiry_filter(self) -> None:
+        future = int(datetime.now(timezone.utc).timestamp()) + 86400
+        self.cache.write_text(
+            json.dumps(
+                {
+                    "fetched_at": int(datetime.now(timezone.utc).timestamp()),
+                    "items": [
+                        {
+                            "appid": 7,
+                            "name": "Still Here",
+                            "capsules": [],
+                            "current": "\u00a50.00",
+                            "original": "\u00a522.00",
+                            "percent": 100,
+                            "end": future,
+                            "review_count": 0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        service = self._service(_StubGiveawayStore(None, fail=True))
+        deals = asyncio.run(service.free_games())
+        self.assertEqual([d.appid for d in deals], [7])
+        self.assertTrue(deals[0].price.is_giveaway)
+
+    def test_a_missing_cache_still_raises(self) -> None:
+        service = self._service(_StubGiveawayStore(None, fail=True))
+        with self.assertRaises(SteamApiError):
+            asyncio.run(service.free_games())
+
+    def test_a_corrupt_cache_still_raises(self) -> None:
+        self.cache.write_text("{not json", encoding="utf-8")
+        service = self._service(_StubGiveawayStore(None, fail=True))
+        with self.assertRaises(SteamApiError):
+            asyncio.run(service.free_games())
+
+    def test_caching_is_optional(self) -> None:
+        # Without a cache path a failure must propagate untouched.
+        service = SteamDealService(
+            store=_StubGiveawayStore(None, fail=True),  # type: ignore[arg-type]
+            heybox=_StubHeybox(),  # type: ignore[arg-type]
+            http=None,  # type: ignore[arg-type]
+        )
+        with self.assertRaises(SteamApiError):
+            asyncio.run(service.free_games())
 
 
 class TopPlayersTests(unittest.TestCase):

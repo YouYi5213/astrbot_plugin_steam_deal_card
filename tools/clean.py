@@ -26,7 +26,7 @@ CACHE_DIRS = ("__pycache__", ".ruff_cache", ".pytest_cache", ".mypy_cache")
 # inside it, and are named with a leading underscore so .gitignore can cover
 # them. Only the root is scanned, never recursively.
 SCRATCH_GLOBS = ("_*.py", "_*.txt", "_*.png", "_*.json")
-SCRATCH_DIRS = ("_scratch",)
+SCRATCH_DIR_GLOB = "_*"
 
 # Real source files that happen to start with an underscore. Named explicitly
 # so a mis-set --root can never delete them.
@@ -61,10 +61,14 @@ def find_targets(root: Path, checkout: Path) -> list[Path]:
 
     for pattern in SCRATCH_GLOBS:
         targets.extend(p for p in root.glob(pattern) if p.name not in PROTECTED)
-    for name in SCRATCH_DIRS:
-        candidate = root / name
-        if candidate.is_dir():
-            targets.append(candidate)
+    # Scratch directories follow the same rule as scratch files. Checked against
+    # the whole workspace root, which holds no underscore-prefixed directory
+    # that is not disposable.
+    targets.extend(
+        p
+        for p in root.glob(SCRATCH_DIR_GLOB)
+        if p.is_dir() and p.name not in PROTECTED and p != checkout
+    )
 
     # Drop anything nested inside another target, so nothing is removed twice.
     unique: list[Path] = []

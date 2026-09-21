@@ -728,6 +728,7 @@ def render_free_card(
     capsules: dict[int, bytes] | None = None,
     title: str = "Steam 限时免费领取",
     now: datetime | None = None,
+    note: str = "",
 ) -> bytes:
     """Render the games currently free to keep for a limited time.
 
@@ -736,6 +737,7 @@ def render_free_card(
         capsules: Mapping of appid to raw capsule image bytes.
         title: Heading shown at the top of the card.
         now: Reference time for remaining-day calculations.
+        note: Optional line under the heading, used to mark cached results.
 
     Returns:
         PNG image bytes.
@@ -749,6 +751,7 @@ def render_free_card(
         show_lowest=False,
         show_discount=True,
         show_end=True,
+        note=note,
     )
 
 

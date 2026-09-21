@@ -97,6 +97,20 @@ def _install_astrbot_stub() -> None:
     star_mod.Context = type("Context", (), {})
     star_mod.Star = _Star
 
+    class _StarTools:
+        """Stand-in for the real data-dir helper.
+
+        The plugin asks for its own data directory at load time; the real one
+        fails when the module was not loaded by AstrBot, which is exactly the
+        case under test.
+        """
+
+        @staticmethod
+        def get_data_dir(plugin_name=None):
+            raise RuntimeError("no plugin context in tests")
+
+    star_mod.StarTools = _StarTools
+
     def _register(*args, **kwargs):
         def decorate(cls):
             return cls

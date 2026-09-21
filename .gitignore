@@ -20,4 +20,4 @@ venv/
 /_*.png
 /_*.py
 /_*.txt
-/_scratch/
+/_*/

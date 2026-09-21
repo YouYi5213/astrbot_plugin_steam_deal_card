@@ -5,12 +5,13 @@ import base64
 import re
 import ssl
 import time
+from pathlib import Path
 
 import httpx
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api import message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .health import run_health_check
 from .models import GameCandidate, GameCard
@@ -18,7 +19,7 @@ from .service import LookupError, SteamDealService, extract_appid
 from .steam_api import HeyboxClient, SteamSearchClient, SteamStoreClient
 
 PLUGIN_NAME = "astrbot_plugin_steam_deal_card"
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.2"
 PLUGIN_REPOSITORY = "https://github.com/YouYi5213/astrbot_plugin_steam_deal_card"
 PLUGIN_DESCRIPTION = (
     "无需 API Key，以图片查询 Steam 游戏当前价、史低、评价与商店图，"
@@ -155,6 +156,7 @@ class SteamDealCardPlugin(Star):
             max_deals=int(self.config.get("max_deals", 10)),
             max_players=int(self.config.get("max_players", 20)),
             search=SteamSearchClient(self.http, language=language),
+            free_cache_path=self._resolve_free_cache_path(),
         )
         # session id -> (candidates, expiry timestamp)
         self._pending: dict[str, tuple[tuple[GameCandidate, ...], float]] = {}
@@ -162,6 +164,23 @@ class SteamDealCardPlugin(Star):
         # plugin loading, but a broken dependency should still be visible in
         # the log without waiting for a user to report "no reply".
         self._health_task = asyncio.create_task(self._run_health_check())
+
+    def _resolve_free_cache_path(self) -> Path | None:
+        """Locate the giveaway cache file, tolerating a missing data dir.
+
+        ``StarTools`` resolves the plugin's own data directory, but it raises
+        when the caller cannot be mapped to a plugin, which happens when the
+        module is imported outside AstrBot. A cache is a convenience, so a
+        failure here must not stop the plugin from loading.
+
+        Returns:
+            The cache file path, or None when no data directory is available.
+        """
+        try:
+            return StarTools.get_data_dir(PLUGIN_NAME) / "free_games_cache.json"
+        except Exception:  # noqa: BLE001 - caching is optional
+            logger.warning("无法确定插件数据目录，喜加一缓存已禁用")
+            return None
 
     async def _run_health_check(self) -> None:
         """Probe the upstream dependencies once, logging the outcome."""

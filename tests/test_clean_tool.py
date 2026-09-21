@@ -77,6 +77,29 @@ class CleanToolSafetyTests(unittest.TestCase):
         found = clean_tool.find_targets(self.root, self.checkout)
         self.assertEqual(found, [scratch_dir])
 
+    def test_any_underscore_directory_is_scratch(self) -> None:
+        # A probe may create its own output directory; it should not need a
+        # code change here to be cleaned up.
+        probe_dir = self.root / "_cache_test"
+        self._write(probe_dir / "free_games_cache.json")
+        found = clean_tool.find_targets(self.root, self.checkout)
+        self.assertEqual(found, [probe_dir])
+
+    def test_the_checkout_itself_is_never_a_target(self) -> None:
+        # The checkout does not start with an underscore, but guard the case
+        # anyway: deleting the project would be catastrophic.
+        odd = self.root / "_astrbot_plugin_steam_deal_card"
+        odd.mkdir()
+        self._write(odd / "main.py")
+        found = clean_tool.find_targets(self.root, odd)
+        self.assertNotIn(odd, found)
+
+    def test_a_real_directory_without_underscore_is_kept(self) -> None:
+        keep = self.root / "astrbot_plugin_someone_else"
+        self._write(keep / "main.py")
+        found = clean_tool.find_targets(self.root, self.checkout)
+        self.assertEqual(found, [])
+
     def test_dry_run_deletes_nothing(self) -> None:
         scratch = self._write(self.root / "_probe.py")
         code = clean_tool.main(["--dry-run", "--root", str(self.root)])

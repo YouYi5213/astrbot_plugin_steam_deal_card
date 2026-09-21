@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 from astrbot.api import logger
 
-from .models import DealItem, GameCandidate, GameCard, PlayerCount
+from .models import DealItem, GameCandidate, GameCard, PlayerCount, PriceInfo, ReviewSummary
 from .name_match import is_confident, rank_candidates
 from .render import (
     render_candidates,
@@ -32,6 +35,9 @@ from .steam_api import (
 
 _APPID_RE = re.compile(r"^\s*(?:appid[=: ]*)?(\d{3,10})\s*$", re.I)
 _STEAM_URL_RE = re.compile(r"store\.steampowered\.com/app/(\d+)", re.I)
+
+# Cache timestamps are rendered for a CN audience.
+_BEIJING = timezone(timedelta(hours=8))
 
 # How many candidates to keep for the disambiguation list.
 _CANDIDATE_LIMIT = 8
@@ -99,6 +105,23 @@ def _dedupe_candidates(candidates: list[GameCandidate]) -> list[GameCandidate]:
     return list(merged.values())
 
 
+def _parse_cached_time(value: object) -> datetime | None:
+    """Convert a cached epoch second back into an aware UTC datetime.
+
+    Args:
+        value: Stored timestamp, or None when the entry had no deadline.
+
+    Returns:
+        The datetime in UTC, or None when the value is missing or unusable.
+    """
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 def extract_appid(text: str) -> int | None:
     """Pull a Steam appid out of a raw query.
 
@@ -130,6 +153,7 @@ class SteamDealService:
         max_deals: int = 10,
         max_players: int = 20,
         search: SteamSearchClient | None = None,
+        free_cache_path: Path | None = None,
     ) -> None:
         """Store the collaborators and defaults.
 
@@ -143,6 +167,10 @@ class SteamDealService:
             max_players: Maximum number of games on the player count card.
             search: Fallback name resolver, defaulting to a storefront search
                 built from the shared HTTP client.
+            free_cache_path: Where to keep the last giveaway list. Only the
+                global storefront carries giveaways, and it is intermittently
+                unreachable from a mainland server, so the last good answer is
+                worth keeping. None disables caching.
         """
         self.store = store
         self.heybox = heybox
@@ -152,6 +180,10 @@ class SteamDealService:
         self.max_deals = max(max_deals, 1)
         self.max_players = max(max_players, 1)
         self.search = search or SteamSearchClient(http)
+        self.free_cache_path = free_cache_path
+        # Set when the giveaway list was served from the cache, so the command
+        # can say so instead of passing stale data off as current.
+        self.free_cache_note = ""
 
     async def resolve_game(self, query: str) -> GameLookupResult:
         """Resolve a query into a single game or a candidate list.
@@ -339,6 +371,11 @@ class SteamDealService:
         once the promotion ends the game is gone from the account forever, so
         the end date is kept rather than stripped.
 
+        Only the global storefront carries giveaways, and that host is
+        intermittently unreachable from a mainland server, so the last good list
+        is cached and reused rather than reporting an error. The reused list is
+        flagged through ``free_cache_note`` so it is never passed off as current.
+
         Args:
             limit: Override for the number of games to return.
 
@@ -346,17 +383,132 @@ class SteamDealService:
             The giveaways, in the storefront's own order.
 
         Raises:
-            LookupError: If the listing cannot be fetched or every row fails.
+            LookupError: If the listing cannot be fetched and no usable cache
+                entry exists.
         """
         wanted = max(limit or self.max_deals, 1)
-        rows = await self.store.specials(self.country, limit=wanted, free_only=True)
+        self.free_cache_note = ""
+        try:
+            rows = await self.store.specials(self.country, limit=wanted, free_only=True)
+        except SteamApiError:
+            cached = self._load_free_cache(wanted)
+            if cached is None:
+                raise
+            deals, self.free_cache_note = cached
+            return deals
         if not rows:
             raise LookupError("暂时没有可以免费领取的游戏。")
-        return await self._enrich_rows(
+        deals = await self._enrich_rows(
             rows,
             "暂时没有可以免费领取的游戏。",
             keep_free_deadline=True,
         )
+        self._save_free_cache(deals)
+        return deals
+
+    def _load_free_cache(self, limit: int) -> tuple[list[DealItem], str] | None:
+        """Rebuild the cached giveaway list, dropping anything already expired.
+
+        Args:
+            limit: How many entries the caller wanted.
+
+        Returns:
+            The rebuilt entries and the note explaining their age, or None when
+            there is no cache or nothing in it is still claimable.
+        """
+        if self.free_cache_path is None:
+            return None
+        try:
+            payload = json.loads(self.free_cache_path.read_text(encoding="utf-8"))
+            fetched_at = datetime.fromtimestamp(int(payload["fetched_at"]), tz=timezone.utc)
+            raw_items = payload["items"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(raw_items, list):
+            return None
+
+        now = datetime.now(timezone.utc)
+        deals: list[DealItem] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            end = _parse_cached_time(raw.get("end"))
+            # A deadline that has passed is worse than no entry at all: the
+            # user cannot claim it any more.
+            if end is not None and end <= now:
+                continue
+            try:
+                appid = int(raw["appid"])
+                name = str(raw["name"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            caps = raw.get("capsules") or []
+            review_count = int(raw.get("review_count") or 0)
+            deals.append(
+                DealItem(
+                    appid=appid,
+                    name=name,
+                    price=PriceInfo(
+                        formatted_current=str(raw.get("current") or ""),
+                        formatted_original=str(raw.get("original") or ""),
+                        discount_percent=int(raw.get("percent") or 0),
+                        discount_end=end,
+                        is_giveaway=True,
+                    ),
+                    capsule_urls=tuple(str(c) for c in caps if c),
+                    reviews=(
+                        ReviewSummary(
+                            label=str(raw.get("review_label") or ""),
+                            percent_positive=int(raw.get("review_percent") or 0),
+                            review_count=review_count,
+                        )
+                        if review_count
+                        else None
+                    ),
+                )
+            )
+        if not deals:
+            return None
+        stamp = fetched_at.astimezone(_BEIJING).strftime("%m-%d %H:%M")
+        note = f"商店暂时不可达，以下为 {stamp} 缓存的结果，可能不是最新"
+        return deals[:limit], note
+
+    def _save_free_cache(self, deals: list[DealItem]) -> None:
+        """Write the giveaway list to disk, ignoring any write failure.
+
+        Args:
+            deals: The freshly fetched giveaways.
+        """
+        if self.free_cache_path is None:
+            return
+        items = [
+            {
+                "appid": deal.appid,
+                "name": deal.name,
+                "capsules": list(deal.capsule_urls),
+                "current": deal.price.formatted_current,
+                "original": deal.price.formatted_original,
+                "percent": deal.price.discount_percent,
+                "end": (
+                    int(deal.price.discount_end.timestamp())
+                    if deal.price.discount_end is not None
+                    else None
+                ),
+                "review_label": deal.reviews.label if deal.reviews else "",
+                "review_percent": deal.reviews.percent_positive if deal.reviews else 0,
+                "review_count": deal.reviews.review_count if deal.reviews else 0,
+            }
+            for deal in deals
+        ]
+        payload = {"fetched_at": int(datetime.now(timezone.utc).timestamp()), "items": items}
+        try:
+            self.free_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.free_cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            # A cache that cannot be written is not worth failing the lookup for.
+            logger.warning("写入喜加一缓存失败：%s", self.free_cache_path)
 
     async def _enrich_rows(
         self,
@@ -622,7 +774,7 @@ class SteamDealService:
         capsules = {
             deal.appid: data for deal, data in zip(deals, images, strict=True) if data is not None
         }
-        return await asyncio.to_thread(render_free_card, deals, capsules)
+        return await asyncio.to_thread(render_free_card, deals, capsules, note=self.free_cache_note)
 
     async def render_ranking(
         self,
